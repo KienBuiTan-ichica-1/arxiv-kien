@@ -10,9 +10,9 @@ def test_recovery(tmp_path):
     assert not s.pending('discovery')
 
 def test_preserve_valid_backup(tmp_path):
-    s=ProgressStore(tmp_path); s.initialize(['2504.02523']); s.save()
+    s=ProgressStore(tmp_path); s.initialize(['2504.02523']); s.save(with_views=True)
     s.path.write_text('corrupt')
-    recovered=ProgressStore(tmp_path); recovered.save()
+    recovered=ProgressStore(tmp_path); recovered.save(with_views=True)
     recovered.path.write_text('another corruption')
     assert len(ProgressStore(tmp_path).rows)==2
 

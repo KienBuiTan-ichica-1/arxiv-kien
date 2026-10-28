@@ -59,3 +59,28 @@ def parse_atom_batch(raw, requested_papers):
         feed.append(entry)
         results[paper]=parse_atom(tostring(feed),paper)
     return {paper:results.get(paper,{'not_found':True,'arxiv_id':paper}) for paper in requested}
+
+
+def parse_version_batch(raw, requested_versions):
+    """Keep versioned identifiers as mapping keys, including v1/v2 of one paper."""
+    requested=list(requested_versions)
+    if not requested or len(set(requested))!=len(requested): raise ValueError('Expected distinct version IDs')
+    if any(re.fullmatch(r'.+v[1-9][0-9]*',v) is None for v in requested): raise ValueError('Expected versioned IDs')
+    try: root=ElementTree.fromstring(raw)
+    except (ParseError,DefusedXmlException) as exc: raise ValueError('Invalid Atom XML') from exc
+    if root.tag!='{http://www.w3.org/2005/Atom}feed': raise ValueError('Expected Atom feed')
+    entries=root.findall('a:entry',NS)
+    total=root.findtext('{http://a9.com/-/spec/opensearch/1.1/}totalResults')
+    if total is not None:
+        try: count=int(total)
+        except ValueError as exc: raise ValueError('Invalid totalResults') from exc
+        if count!=len(entries): raise ValueError('Incomplete batch response')
+    results={}
+    for entry in entries:
+        match=re.search(r'/abs/(.+)v([1-9][0-9]*)$',entry.findtext('a:id',default='',namespaces=NS))
+        if not match: raise ValueError('Atom ID mismatch or error entry')
+        identifier=f'{match[1]}v{match[2]}'
+        if identifier not in requested or identifier in results: raise ValueError('Unexpected or duplicate version entry')
+        feed=Element('{http://www.w3.org/2005/Atom}feed'); feed.append(entry)
+        results[identifier]=parse_atom(tostring(feed),match[1],int(match[2]))
+    return {v:results.get(v,{'not_found':True,'arxiv_id':re.sub(r'v[1-9][0-9]*$','',v)}) for v in requested}

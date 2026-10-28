@@ -12,7 +12,7 @@ class Body(httpx.AsyncByteStream):
 
 def test_source_truncation_three_attempts_then_resume(tmp_path,monkeypatch):
     monkeypatch.chdir(tmp_path)
-    c=CrawlerConfig(); c.range['end_id']=2524
+    c=CrawlerConfig(); c.execution['allow_anonymous_s2']=True; c.range['end_id']=2524
     calls=[]; clock=[1000.]
     async def sleep(n): clock[0]+=n
     tex=b'\\documentclass{article}\n\\includegraphics{figure}\n'

@@ -6,6 +6,7 @@ import shutil
 import threading
 from pathlib import Path
 from .storage import Storage, atomic_json, digest
+from .journal import ProgressJournal
 
 class ProgressStore:
     columns=['paper','version','stage','offset','status','attempts','total','cycle','error']
@@ -13,8 +14,11 @@ class ProgressStore:
         self.root=Path(root); self.path=self.root/'progress'/'jobs.csv'
         self.lock=threading.RLock(); self.rows={}; self.storage=Storage(root); self.reference_counts={}
         self.dirty_count = 0
-        if self.path.exists() or self.path.with_suffix('.bak').exists() or self.path.with_suffix('.csv.json').exists() or (self.root/'progress/papers.csv').exists() or (self.root/'progress/versions.csv').exists() or (self.root/'progress/backups').exists() or (self.root/'data').exists(): self.load()
+        self.journal=ProgressJournal(self.root/'progress/jobs.journal.jsonl')
+        self._saved_rows={}
+        if self.path.exists() or self.path.with_suffix('.bak').exists() or self.path.with_suffix('.csv.json').exists() or (self.root/'progress/papers.csv').exists() or (self.root/'progress/versions.csv').exists() or (self.root/'progress/backups').exists() or (self.root/'data').exists() or self.journal.path.exists(): self.load()
     def load(self):
+        self.journal=ProgressJournal(self.root/'progress/jobs.journal.jsonl')
         for path in (self.path,self.path.with_suffix('.bak')):
             try:
                 manifest=json.loads(path.with_suffix(path.suffix+'.json').read_text())
@@ -30,7 +34,9 @@ class ProgressStore:
                     if key in converted: raise ValueError('Duplicate job')
                     converted[key]=r
                 if len(converted)!=manifest['count']: raise ValueError('Invalid row count')
+                self.journal.replay(converted,manifest.get('journal_sequence',0))
                 self.rows=converted
+                self._saved_rows={k:dict(r) for k,r in self.rows.items()}
                 view=self.root/'progress/papers.csv'
                 if view.exists():
                     try:
@@ -41,6 +47,16 @@ class ProgressStore:
             except (OSError,ValueError,KeyError): continue
         raise RuntimeError('Progress and backup unavailable or corrupt; refusing empty dataset')
     def save(self, with_views=False):
+        changed=[dict(row) for key,row in self.rows.items() if self._saved_rows.get(key)!=row]
+        if self.path.exists() or self._saved_rows:
+            if changed: self.journal.append(changed)
+            if with_views or not self.path.exists(): self._write_snapshot()
+        else:
+            self._write_snapshot()
+        self._saved_rows={key:dict(row) for key,row in self.rows.items()}
+        if with_views: self.write_views()
+
+    def _write_snapshot(self):
         self.path.parent.mkdir(parents=True,exist_ok=True)
         tmp=self.path.with_suffix('.tmp')
         with tmp.open('w',newline='',encoding='utf8') as f:
@@ -63,11 +79,9 @@ class ProgressStore:
         tmp.replace(self.path)
         atomic_json(
             self.path.with_suffix('.csv.json'),
-            dict(sha256=checksum,count=len(self.rows)))
+            dict(sha256=checksum,count=len(self.rows),journal_sequence=self.journal.sequence))
         if digest(self.path) != checksum: 
             raise OSError('CSV readback failed')
-        if with_views:
-            self.write_views()
     def add(self,key):
         if key not in self.rows:
             paper,version,stage,offset=key
@@ -141,7 +155,7 @@ class ProgressStore:
                 if stages and key[2] not in stages: continue
                 if ids is not None and key[0] not in ids: continue
                 if row['status']==status or (key[2]=='references' and key[0] in retry_papers and (row['status']!='succeeded' or not self.valid_reference_page(key[0],key[3]))):
-                    if status=='not_found' and key[2]=='discovery': self.storage.archive_result(key)
+                    if status=='not_found' and key[2] in ('discovery','metadata'): self.storage.archive_result(key)
                     row.update(status='pending',attempts=0,cycle=row['cycle']+1,error='')
             self.save()
 

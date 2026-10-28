@@ -162,3 +162,38 @@ def test_empty_batch_preserves_evidence_and_resumes(tmp_path,monkeypatch):
     assert store.status_counts()['discovery']=={'not_found':2}
     asyncio.run(run_pipeline(config,{'arxiv'},limit=2,transport=httpx.MockTransport(handler)))
     assert len(calls)==1
+
+def test_version_batch_maps_exact_versions():
+    from crawler.arxiv_client import parse_version_batch
+    raw=b'<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/2504.02523v2</id><updated>2026-01-02</updated></entry><entry><id>http://arxiv.org/abs/2504.02523v1</id><updated>2025-04-03</updated></entry></feed>'
+    parsed=parse_version_batch(raw,['2504.02523v1','2504.02523v2'])
+    assert parsed['2504.02523v1']['updated']=='2025-04-03'
+    assert parsed['2504.02523v2']['updated']=='2026-01-02'
+    with pytest.raises(ValueError): parse_version_batch(raw,['2504.02523v1'])
+
+def test_metadata_batch_pipeline_distinct_dates_and_retry(tmp_path,monkeypatch):
+    from crawler.pipeline import run_pipeline
+    monkeypatch.chdir(tmp_path)
+    config=CrawlerConfig(); config.range['end_id']=2523
+    clock=[1000.]; calls=[]; attempts=[0]
+    async def sleep(n): clock[0]+=n
+    def handler(request):
+        if request.url.path.startswith('/src/'): return httpx.Response(404)
+        ids=request.url.params['id_list'].split(','); calls.append(ids)
+        if ids==['2504.02523']: return httpx.Response(200,content=feed(['2504.02523']).replace(b'v1</id>',b'v2</id>'))
+        attempts[0]+=1
+        if attempts[0]==1: return httpx.Response(503)
+        entries=''.join(f'<entry><id>http://arxiv.org/abs/{identifier}</id><updated>2025-04-0{identifier[-1]}</updated></entry>' for identifier in ids[::-1])
+        return httpx.Response(200,content=f'<feed xmlns="http://www.w3.org/2005/Atom">{entries}</feed>'.encode())
+    asyncio.run(run_pipeline(config,{'arxiv'},limit=1,transport=httpx.MockTransport(handler),now=lambda:clock[0],sleep=sleep))
+    assert calls==[['2504.02523'],['2504.02523v1','2504.02523v2'],['2504.02523v1','2504.02523v2']]
+    store=ProgressStore('runtime')
+    import json
+    for version in (1,2):
+        key=('2504.02523',version,'metadata',0)
+        assert store.get(key)['attempts']==2
+        assert store.storage.verify(key)
+        assert json.loads((store.storage.result_dir(key)/'normalized.json').read_text())['updated']==f'2025-04-0{version}'
+    before=len(calls)
+    asyncio.run(run_pipeline(config,{'arxiv'},limit=1,transport=httpx.MockTransport(handler),now=lambda:clock[0],sleep=sleep))
+    assert len(calls)==before

@@ -9,5 +9,6 @@ paths:
   scratch_root: runtime/temp
 network:
   discovery_batch_size: 50
+  metadata_batch_size: 50
 execution:
-  allow_anonymous_s2: true
+  allow_anonymous_s2: false

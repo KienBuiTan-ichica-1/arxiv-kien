@@ -31,8 +31,9 @@ smoke bản cập nhật. Mỗi run tự lưu phiên bản package trong environ
 
 ## Dữ liệu và tương thích với bản đầu
 
-- `runtime/progress/jobs.csv`: ledger bền vững cho attempts từng request/page,
-  giữ tương thích dữ liệu smoke cũ. Không xóa hoặc sửa tay file này.
+- `runtime/progress/jobs.csv`: snapshot progress; `jobs.journal.jsonl` giữ các
+  cập nhật mới hơn snapshot. Resume dùng cả hai, giữ tương thích dữ liệu cũ.
+  Không xóa/sửa tay journal hoặc hạ code về bản không đọc journal.
 - `papers.csv`, `versions.csv`: snapshots theo schema đặc tả, tạo tự động từ
   ledger khi checkpoint. `status_counts()` đếm references theo bài, không cộng
   page rows. Đây là lựa chọn tương thích: ledger giữ lịch sử retry chi tiết,
@@ -71,7 +72,8 @@ sampling có thể bỏ lỡ spike. Các metrics cũ chưa đo không được d
 10. Sau smoke/interrupt check đạt, có thể chủ động chạy full range qua CLI hoặc
     `await run_pipeline(config, {'arxiv','s2'}, resume=True, limit=None)`.
 
-Bật anonymous khi chưa có key: `execution.allow_anonymous_s2: true` (config mẫu).
+Config mẫu yêu cầu key (`allow_anonymous_s2: false`). Chỉ thử anonymous khi chủ động
+bật `execution.allow_anonymous_s2: true`; không dùng cấu hình đó cho full crawl.
 Env `SEMANTIC_SCHOLAR_API_KEY` ưu tiên hơn Secrets. 401/403 dừng dịch vụ tương ứng,
 không tự hạ xuống anonymous. Anonymous pacing là chính sách bảo thủ của dự án.
 
@@ -126,7 +128,8 @@ trước terminal checkpoint. Metrics ghi danh sách jobs của batch, chỉ c�
 gian request một lần.
 
 `papers.csv`/`versions.csv` là views có thể trễ tối đa 49 terminal mutations;
-`jobs.csv` vẫn checkpoint mỗi request hoặc terminal batch. Dùng CLI status hoặc
+Progress journal vẫn checkpoint mỗi request hoặc terminal batch; `jobs.csv`
+được compact cùng các view theo đợt và lúc kết thúc/reconcile. Dùng CLI status hoặc
 `status_counts()` khi đang chạy. Views được flush ở cuối phiên và reconcile.
 
 Notebook `5000_crawl.ipynb` mặc định smoke 10 ID. Muốn dùng SSD, notebook tạo
@@ -135,3 +138,39 @@ config/log không lưu mount path hoặc đường dẫn SSD tuyệt đối. Khi
 link hỏng được tạo lại, staging dở tải lại từ đầu, kết quả complete nằm trên Drive.
 Sau cập nhật code cần restart kernel trước khi import lại crawler. Chỉ bật
 `RUN_FULL_RANGE=True` sau khi smoke mới và interrupt/resume đã đạt.
+
+## Tối ưu thời gian và I/O
+
+- `network.metadata_batch_size: 50` gom các versioned ID còn cùng budget. Mapping
+  theo chính xác `IDvN`, không dùng base ID làm khóa metadata phiên bản. Giá trị
+  có thể hạ xuống 1 để kiểm chứng endpoint khi smoke. Source vẫn tải riêng.
+- Full reconcile/checksum chỉ chạy lúc bắt đầu/resume. Trong phiên, mỗi result
+  vừa publish được checksum/readback và cập nhật progress riêng; không quét lại
+  toàn dataset sau mỗi metadata request.
+- `jobs.journal.jsonl` append các row thay đổi, hash chain và fsync/readback trước
+  request. CSV đầy đủ được compact mỗi đợt view (50 terminal mutations) và cuối
+  phiên. Dòng cuối journal thiếu newline do crash bị bỏ qua; checksum/sequence
+  sai ở record hoàn chỉnh làm dừng recovery. Backup CSV replay journal để giữ
+  attempts mới hơn. Journal được giữ nguyên để backup cũ còn phục hồi được.
+- Migrate tự động: snapshot jobs.csv cũ vẫn đọc được; journal mới được tạo khi
+  có mutation. Khi sao lưu/chuyển dataset, phải mang cả thư mục progress. Không
+  chạy bản crawler cũ trên dataset đã có journal vì bản cũ không đọc delta.
+- Disk metrics quét baseline một lần, sau đó cập nhật file/subtree vừa thay đổi
+  (paper, progress và staging), không rglob toàn Drive ở mỗi request/sample.
+  Có `metrics.reconcile_disk()` để đối soát đầy đủ một cách chủ động/thưa.
+  Staging thành công được xóa sau publish, staging thất bại giữ để chẩn đoán.
+- RAM/disk metrics vẫn là mẫu quan sát, không bảo đảm bắt được spike giữa hai
+  mẫu. Các file nguồn cuối vẫn giữ cấu trúc TeX/Bib trên Drive; chưa đổi sang
+  định dạng archive để tránh thay đổi hợp đồng dữ liệu. Vì vậy I/O nhiều file
+  nhỏ và quota Drive vẫn cần được quan sát trong smoke dài hơn.
+
+Ước lượng: nếu có 7.000 phiên bản và hai nhánh metadata gom được đầy batch,
+khoảng nghỉ arXiv riêng cho 100 discovery + 140 metadata + 7.000 source requests
+là khoảng 6 giờ. Đây chỉ là phép tính theo request count, chưa gồm tải/giải nén,
+Drive publish, retry/cooldown hoặc thời gian mất do runtime reset. Không cam kết
+xong trong một phiên Colab. Chưa có benchmark Colab thật cho bản tối ưu này.
+
+Journal fsync file và đọc lại trước request; khi tạo journal còn thử fsync directory.
+Nếu Drive/FUSE báo không hỗ trợ directory fsync, event `request_start` ghi
+`journal_directory_sync=false`. Đây là checkpoint best-effort theo filesystem,
+không cam kết độ bền như đĩa local khi mất điện/hỏng mount.

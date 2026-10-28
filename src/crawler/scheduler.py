@@ -40,8 +40,8 @@ class Scheduler:
         if not batch_keys or len(set(batch_keys))!=len(batch_keys): raise ValueError('Expected distinct job keys')
         attempts={self.store.get(k)['attempts'] for k in batch_keys}
         if len(attempts)!=1: raise ValueError('Batch members must have the same attempt count')
-        if len(batch_keys)>1 and (service!='arxiv' or any(k[2]!='discovery' for k in batch_keys)):
-            raise ValueError('Batch requests support discovery only')
+        if len(batch_keys)>1 and (service!='arxiv' or len({k[2] for k in batch_keys})!=1 or any(k[2] not in ('discovery','metadata') for k in batch_keys)):
+            raise ValueError('Batch requests support homogeneous arXiv metadata stages only')
         primary_key = batch_keys[0]
         def emit(name,**fields):
             fields.pop('job',None)
@@ -66,7 +66,7 @@ class Scheduler:
                 if service=='s2' and self.api_key: headers['x-api-key']=self.api_key
                 code=0; error_code='unknown'; received=0; redirected=False
                 started=time.monotonic()
-                emit('request_start',job = primary_key, service=service,attempt=self.store.get(primary_key)['attempts'])
+                emit('request_start',job = primary_key, service=service,attempt=self.store.get(primary_key)['attempts'],journal_directory_sync=self.store.journal.directory_sync_supported)
                 try:
                     async with self.client.stream('GET',url,params=params,headers=headers,follow_redirects=False) as response:
                         code=response.status_code
@@ -108,6 +108,7 @@ class Scheduler:
                                             raise OSError('Insufficient disk space during download')
                                         f.write(chunk)
                                         received+=len(chunk)
+                                        if self.metrics: self.metrics.touch(target)
                                 metadata.update(
                                     bytes_received = received,
                                     complete = True,
@@ -164,6 +165,8 @@ class Scheduler:
                         seconds = time.monotonic()-started
                     )
                     if self.metrics:
+                        if target: self.metrics.touch(target,target.with_suffix('.response.json'))
+                        self.metrics.touch(self.store.root/'progress')
                         self.metrics.sample(force_disk=True)
 
                 attempt=self.store.get(primary_key)['attempts']

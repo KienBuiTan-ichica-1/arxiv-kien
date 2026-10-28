@@ -15,7 +15,7 @@ from .progress import ProgressStore
 from .storage import atomic_json, digest
 from .scheduler import Scheduler
 from .secrets import load_semantic_scholar_key
-from .arxiv_client import parse_atom, parse_atom_batch
+from .arxiv_client import parse_atom_batch, parse_version_batch
 from .semantic_scholar import parse_page,FIELDS
 from .sources import inspect_and_extract
 
@@ -39,16 +39,28 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
     monitor=asyncio.create_task(metrics.monitor())
     scratch=Path(config.paths['scratch_root'])/run_id
     scratch.mkdir(parents=True,exist_ok=True)
-    async def metadata(key,scheduler):
-        raw=await scheduler.request(key,'arxiv','https://export.arxiv.org/api/query',params={'id_list':key[0]+(f'v{key[1]}' if key[1] else '')},validate=lambda raw:(raw,parse_atom(raw,key[0],key[1] or None)))
-        if raw is None: return
-        raw,parsed=raw
-        if parsed.get('not_found'): store.finish(key,'not_found'); return
-        staging=scratch/f'{quote(key[0],safe="")}-v{key[1]}-{key[2]}'
-        staging.mkdir(parents=True,exist_ok=True)
-        (staging/'response.xml').write_bytes(raw); atomic_json(staging/'normalized.json',parsed)
-        before=time.monotonic(); store.storage.commit(key,staging); store.reconcile(recover_running=False)
-        metrics.record('commit',job=key,seconds=time.monotonic()-before)
+    async def metadata_batch(keys,scheduler):
+        identifiers=[f'{key[0]}v{key[1]}' for key in keys]
+        artifact=await scheduler.request(keys,'arxiv','https://export.arxiv.org/api/query',params={'id_list':','.join(identifiers),'max_results':len(keys)},validate=lambda raw:(raw,parse_version_batch(raw,identifiers)))
+        if artifact is None: return
+        raw,parsed_versions=artifact; results=[]
+        for key,identifier in zip(keys,identifiers):
+            parsed=parsed_versions[identifier]
+            staging=scratch/f'{quote(key[0],safe="")}-v{key[1]}-metadata'
+            staging.mkdir(parents=True,exist_ok=True)
+            (staging/'response.xml').write_bytes(raw)
+            atomic_json(staging/'request.json',dict(id_list=identifiers,max_results=len(keys)))
+            atomic_json(staging/'normalized.json',parsed)
+            before=time.monotonic()
+            status='not_found' if parsed.get('not_found') else 'succeeded'
+            store.storage.commit(key,staging,status)
+            metrics.touch(store.storage.paper_dir(key[0]),staging)
+            metrics.record('commit',job=key,seconds=time.monotonic()-before)
+            shutil.rmtree(staging); metrics.touch(staging)
+            results.append((key,status,''))
+        store.finish_many(results)
+        metrics.touch(root/'progress')
+
     async def arxiv(scheduler):
         discovery_turn = True
         while 'arxiv' not in scheduler.stopped:
@@ -66,7 +78,12 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
                 continue
             key=versions[0]
             discovery_turn=True
-            if key[2]!='source': await metadata(key,scheduler); continue
+            if key[2]=='metadata':
+                attempts=store.get(key)['attempts']
+                size=min(config.network['metadata_batch_size'],config.execution['queue_capacity'])
+                batch=[k for k in versions if k[2]=='metadata' and store.get(k)['attempts']==attempts][:size]
+                await metadata_batch(batch,scheduler)
+                continue
             archive=scratch/f'{quote(key[0],safe="")}v{key[1]}.download'
             staging=scratch/f'{quote(key[0],safe="")}v{key[1]}-source'
             try:
@@ -79,6 +96,8 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
                 if response_info.exists(): shutil.copyfile(response_info,staging/'response.json')
                 before=time.monotonic(); store.storage.commit(key,staging,result['status']); store.finish(key,result['status']); archive.unlink(missing_ok=True)
                 metrics.record('commit',job=key,seconds=time.monotonic()-before)
+                metrics.touch(store.storage.paper_dir(key[0]),archive,staging,root/'progress')
+                shutil.rmtree(staging); metrics.touch(staging)
                 metrics.sample(force_disk=True)
     async def references(scheduler):
         for paper in ids:
@@ -112,12 +131,14 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
                     raw,page=raw
                     page_path.write_bytes(raw)
                     atomic_json(marker_path,dict(sha256=digest(page_path),fingerprint=fingerprint))
+                    metrics.touch(page_path,marker_path)
                 if offset:
                     store.finish(key,'succeeded')
                 refs.extend(page['references']); unresolved+=page['unresolved_count']
                 if page['next'] is None:
                     atomic_json(staging/'normalized.json',dict(references=refs,unresolved_count=unresolved,fetched_at=utc_now(),query_fingerprint=fingerprint))
                     before=time.monotonic(); store.storage.commit(base,staging); store.reference_counts[paper]=len(refs); store.finish(base,'succeeded')
+                    metrics.touch(store.storage.paper_dir(base[0]),root/'progress')
                     metrics.record('commit',job=base,seconds=time.monotonic()-before)
                     break
                 offset=page['next']
@@ -151,9 +172,12 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
             # reconstructs missing rows from any valid discovery marker.
             for version in range(1,parsed.get('version',0)+1):
                 for stage in ('metadata','source'): store.add((paper,version,stage,0))
+            metrics.touch(store.storage.paper_dir(key[0]),staging)
             metrics.record('commit',job=key,seconds=time.monotonic()-before)
+            shutil.rmtree(staging); metrics.touch(staging)
             results.append((key,status,''))
         store.finish_many(results)
+        metrics.touch(root/'progress')
     completed=False
     try:
         timeout=httpx.Timeout(config.network['read_timeout_seconds'],connect=config.network['connect_timeout_seconds'])

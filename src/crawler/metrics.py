@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import psutil
 from .storage import atomic_json
+from .disk_usage import DiskUsage
 
 
 def utc_now(): return datetime.now(timezone.utc).isoformat()
@@ -44,6 +45,7 @@ class MetricsRecorder:
             try: packages[name]=importlib.metadata.version(name)
             except importlib.metadata.PackageNotFoundError: packages[name]=None
         atomic_json(self.directory/'environment.json',dict(run_id=run_id,started_at=self.started_at,python=platform.python_version(),packages=packages,cpu_count=psutil.cpu_count(),ram_available_bytes=psutil.virtual_memory().available,disk_free_bytes=shutil.disk_usage(self.root).free,authentication=self.auth_mode,config=asdict(self.config)))
+        self.disk=DiskUsage(self.config.paths.values())
         self.sample(force_disk=True)
     def record(self,event,**fields):
         # Callers pass only identifiers, durations, status codes; never headers/body/exception text.
@@ -61,17 +63,24 @@ class MetricsRecorder:
         for child in process.children(recursive=True):
             try: rss+=child.memory_info().rss
             except (psutil.NoSuchProcess,psutil.AccessDenied): pass
-        if force_disk or elapsed-self.last_disk>=self.config.execution['disk_sample_seconds']:
-            total=0
-            for root in unique_roots(self.config.paths.values()):
-                for path in root.rglob('*'):
-                    try:
-                        if path.is_file() and not path.is_symlink(): total+=path.stat().st_size
-                    except FileNotFoundError: pass
-            self.disk_bytes=total; self.last_disk=elapsed
+        # `force_disk` now samples the incremental counter, never a full walk.
+        if elapsed-self.last_disk>=self.config.execution['disk_sample_seconds'] or force_disk:
+            for name in ('environment.json','checkpoint.json','resources.csv','paper_metrics.csv','summary.json'): self.disk.touch(self.directory/name)
+            self.disk.touch(self.root/'logs'/self.run_id/'events.jsonl')
+            self.last_disk=elapsed
+        self.disk_bytes=self.disk.total
         self.samples.append((elapsed,rss,self.disk_bytes))
         atomic_json(self.directory/'checkpoint.json',dict(run_id=self.run_id,started_at=self.started_at,last_sample_at=utc_now(),wall_seconds=elapsed,incomplete=True,event_seconds=self.durations))
         self.writer.writerow(dict(elapsed_seconds=elapsed,utc=utc_now(),rss_bytes=rss,disk_bytes=self.disk_bytes)); self.resources.flush()
+    def touch(self,*paths):
+        for path in paths: self.disk.touch(path)
+        self.disk_bytes=self.disk.total
+
+    def reconcile_disk(self):
+        """Explicit, infrequent audit; not called for each sample/request."""
+        self.disk.reconcile()
+        self.disk_bytes=self.disk.total
+
     async def monitor(self):
         while True:
             await asyncio.sleep(self.config.execution['ram_sample_seconds'])
@@ -86,7 +95,7 @@ class MetricsRecorder:
             paper_rows.append(dict(arxiv_id=paper,run_id=self.run_id,elapsed_seconds=self.paper_end[paper]-start,complete=complete))
         with (self.directory/'paper_metrics.csv').open('w',newline='',encoding='utf8') as f:
             writer=csv.DictWriter(f,fieldnames=['arxiv_id','run_id','elapsed_seconds','complete']); writer.writeheader(); writer.writerows(paper_rows)
-        summary=dict(run_id=self.run_id,started_at=self.started_at,finished_at=utc_now(),wall_seconds=wall,rss_peak_bytes=max(s[1] for s in self.samples),rss_time_weighted_mean_bytes=weighted_mean([(s[0],s[1]) for s in self.samples]),disk_observed_peak_bytes=max(s[2] for s in self.samples),ram_sample_seconds=self.config.execution['ram_sample_seconds'],disk_sample_seconds=self.config.execution['disk_sample_seconds'],sampling_note='Observed peaks can miss spikes between samples',authentication=self.auth_mode,status_counts=store.status_counts() if store else {})
+        summary=dict(run_id=self.run_id,started_at=self.started_at,finished_at=utc_now(),wall_seconds=wall,rss_peak_bytes=max(s[1] for s in self.samples),rss_time_weighted_mean_bytes=weighted_mean([(s[0],s[1]) for s in self.samples]),disk_observed_peak_bytes=max(s[2] for s in self.samples),ram_sample_seconds=self.config.execution['ram_sample_seconds'],disk_sample_seconds=self.config.execution['disk_sample_seconds'],sampling_note='Incremental logical file-byte counters; observed peaks can miss spikes between samples; not filesystem allocation',authentication=self.auth_mode,status_counts=store.status_counts() if store else {})
         previous=[]; interrupted=[]
         for directory in (self.root/'metrics').iterdir():
             if not directory.is_dir() or directory.name==self.run_id: continue

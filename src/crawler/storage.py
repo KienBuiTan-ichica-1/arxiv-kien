@@ -49,7 +49,7 @@ class Storage:
         try:
             marker=json.loads((target/'complete.json').read_text())
             if marker['key']!=list(key): return None
-            allowed=('succeeded','not_found') if key[2]=='discovery' else ('succeeded','no_tex')
+            allowed=('succeeded','not_found') if key[2] in ('discovery','metadata') else ('succeeded','no_tex')
             if marker.get('status') not in allowed or not marker.get('checksums'): return None
             required='inventory.json' if key[2]=='source' else 'normalized.json'
             if required not in marker['checksums']: return None
