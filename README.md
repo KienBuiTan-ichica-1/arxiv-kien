@@ -134,7 +134,8 @@ Progress journal vẫn checkpoint mỗi request hoặc terminal batch; `jobs.csv
 được compact cùng các view theo đợt và lúc kết thúc/reconcile. Dùng CLI status hoặc
 `status_counts()` khi đang chạy. Views được flush ở cuối phiên và reconcile.
 
-Notebook `5000_crawl.ipynb` mặc định smoke 10 ID. Muốn dùng SSD, notebook tạo
+Notebook duy nhất `crawl_colab.ipynb` có smoke 10 ID và cell toàn range,
+mặc định `RUN_FULL_RANGE=False`. Muốn dùng SSD, notebook tạo
 project path tương đối `scratch` là symlink đến thư mục tạm do hệ điều hành cấp;
 config/log không lưu mount path hoặc đường dẫn SSD tuyệt đối. Khi runtime reset,
 link hỏng được tạo lại, staging dở tải lại từ đầu, kết quả complete nằm trên Drive.
@@ -176,3 +177,43 @@ Journal fsync file và đọc lại trước request; khi tạo journal còn th�
 Nếu Drive/FUSE báo không hỗ trợ directory fsync, event `request_start` ghi
 `journal_directory_sync=false`. Đây là checkpoint best-effort theo filesystem,
 không cam kết độ bền như đĩa local khi mất điện/hỏng mount.
+
+## Đổi range đầu vào trong Colab
+
+Sửa `config/crawler.yaml` trong repo; bản clone trên Drive là
+`code/config/crawler.yaml`. Ví dụ range hiện tại:
+
+```yaml
+range:
+  start_month: '2025-04'
+  start_id: 2523
+  end_month: '2025-04'
+  end_id: 7522
+```
+
+Nó sinh `2504.02523` đến `2504.07522`, inclusive: 5.000 ID. Thay tháng bằng
+chuỗi `YYYY-MM` và thay số thứ tự bằng integer, không cần tự thêm số 0 đầu.
+Hiện chỉ hỗ trợ start_month bằng end_month. Đây là tháng của arXiv ID, không
+phải bộ lọc ngày/giờ published hoặc updated. Muốn nhiều tháng, chạy các range
+cùng-tháng riêng; chưa tự suy số ID cuối mỗi tháng.
+
+Sau khi sửa YAML, chạy lại cell `load_config` và cell scratch nếu dùng SSD.
+Notebook in ID đầu/cuối và tổng số để kiểm tra. Smoke vẫn giới hạn 10 ID đầu;
+cell toàn range dùng `limit=None` theo range mới, không hardcode 5.000.
+
+Nếu là dataset/range mới độc lập, dùng persistent root tương đối khác, ví dụ:
+
+```yaml
+paths:
+  persistent_root: runtime_2505_sample
+  scratch_root: runtime_2505_sample/temp
+```
+
+Không dùng cùng progress cho hai dataset độc lập: code hiện upsert ID mới,
+không tự xóa ID cũ, nên status/export sẽ gồm cả các ID đã tồn tại trong root đó.
+Nếu đang resume dataset hiện tại, giữ nguyên persistent_root và range.
+Nên sửa cấu hình trong repo rồi commit/push để lần git pull sau không xung đột
+với YAML sửa riêng trong bản clone trên Drive.
+
+`notebooks/5000_crawl.ipynb` đã được thay bằng cell toàn range trong
+`notebooks/crawl_colab.ipynb`; chỉ cần duy trì một notebook.
