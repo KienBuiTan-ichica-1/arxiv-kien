@@ -27,90 +27,159 @@ class Scheduler:
             before=time.monotonic()
             await self.sleep(duration)
             self.event('wait_end',job=job,reason=reason,seconds=time.monotonic()-before)
-    async def request(self,key,service,url,params=None,target=None,validate=None):
-        if service in self.stopped: return None
-        expected_host='export.arxiv.org' if service=='arxiv' else 'api.semanticscholar.org'
-        if urlsplit(url).hostname!=expected_host or urlsplit(url).scheme!='https': raise ValueError('Disallowed service URL')
+    async def request(self, key, service, url, params=None, target=None, validate=None):
+        if service in self.stopped: 
+            return None
+        expected_host = 'export.arxiv.org' if service=='arxiv' else 'api.semanticscholar.org'
+        if urlsplit(url).hostname != expected_host or urlsplit(url).scheme!='https': raise ValueError('Disallowed service URL')
         net=self.config.network; state=self.state[service]
-        gap=net['arxiv_gap_seconds'] if service=='arxiv' else net['s2_key_gap_seconds' if self.api_key else 's2_anonymous_gap_seconds']
-        queued=time.monotonic()
+        gap = net['arxiv_gap_seconds'] if service == 'arxiv' else net['s2_key_gap_seconds' if self.api_key else 's2_anonymous_gap_seconds']
+        queued = time.monotonic()
+        
+        batch_keys = key if isinstance(key, list) else [key]
+        primary_key = batch_keys[0]
+        
         async with self.locks[service]:
-            self.event('queue_acquired',job=key,seconds=time.monotonic()-queued)
-            while self.store.get(key)['attempts']<3:
-                state['recent']=[t for t in state['recent'] if t>self.now()-net['s2_anonymous_window_seconds']]
-                deadline=state['deadline']
-                if service=='s2' and not self.api_key and len(state['recent'])>=net['s2_anonymous_window_requests']:
-                    deadline=max(deadline,state['recent'][0]+net['s2_anonymous_window_seconds'])
-                await self.wait(deadline,key)
-                self.store.start_attempt(key)
-                if service=='s2': state['recent'].append(self.now())
+            self.event('queue_acquired',job = primary_key,seconds=time.monotonic()-queued)
+            while self.store.get(primary_key)['attempts']<3:
+                state['recent'] = [
+                    t for t in state['recent'] 
+                    if t > self.now()-net['s2_anonymous_window_seconds']]
+                deadline = state['deadline']
+                if service == 's2' and not self.api_key and len(state['recent'])>=net['s2_anonymous_window_requests']:
+                    deadline = max(
+                        deadline, state['recent'][0] + net['s2_anonymous_window_seconds'])
+                await self.wait(deadline, primary_key)
+                for k in batch_keys: 
+                    self.store.start_attempt(k)
+                if service == 's2': 
+                    state['recent'].append(self.now())
                 self.persist()
                 headers={'User-Agent':net['user_agent']}
                 if service=='s2' and self.api_key: headers['x-api-key']=self.api_key
                 code=0; error_code='unknown'; received=0; redirected=False
-                started=time.monotonic(); self.event('request_start',job=key,service=service,attempt=self.store.get(key)['attempts'])
+                started=time.monotonic()
+                self.event('request_start',job = primary_key, service=service,attempt=self.store.get(primary_key)['attempts'])
                 try:
                     async with self.client.stream('GET',url,params=params,headers=headers,follow_redirects=False) as response:
                         code=response.status_code
                         retry_after=parse_retry_after(response.headers.get('Retry-After'),datetime.fromtimestamp(self.now(),timezone.utc))
                         if code==429:
-                            state['backoff']=state['backoff']*2 or 60
-                            state['deadline']=max(state['deadline'],self.now()+(retry_after if retry_after is not None else state['backoff']))
+                            state['backoff'] = state['backoff']*2 or 60
+                            state['deadline'] = max(state['deadline'],self.now()+(retry_after if retry_after is not None else state['backoff']))
                         else:
-                            state['backoff']=0
-                            if retry_after is not None: state['deadline']=max(state['deadline'],self.now()+retry_after)
+                            state['backoff'] = 0
+                            if retry_after is not None: 
+                                state['deadline'] = max(state['deadline'],self.now()+  retry_after)
                         self.persist()
-                        if code in (301,302,303,307,308):
+                        
+                        if code in (301, 302, 303, 307, 308):
                             location=response.headers.get('Location','')
                             redirect=urljoin(str(response.url),location)
                             parsed=urlsplit(redirect)
                             if not location or parsed.scheme!='https' or parsed.hostname!=expected_host or parsed.username or parsed.password:
-                                self.store.finish(key,'failed','redirect_disallowed'); return None
-                            self.event('redirect',job=key,host=parsed.hostname)
+                                for k in batch_keys:
+                                    self.store.finish(k,'failed','redirect_disallowed') 
+                                return None
+                            self.event('redirect',job=primary_key,host=parsed.hostname)
                             url=redirect; params=None; redirected=True
                         elif code==200:
                             if target:
                                 target.parent.mkdir(parents=True,exist_ok=True)
-                                metadata=dict(status_code=code,content_type=response.headers.get('content-type'),content_encoding=response.headers.get('content-encoding'),content_length=response.headers.get('content-length'),effective_url=str(response.url.copy_with(query=None)),bytes_received=0,complete=False)
+                                metadata = dict(
+                                    status_code=code,
+                                    content_type=response.headers.get('content-type'),
+                                    content_encoding=response.headers.get('content-encoding'),
+                                    content_length=response.headers.get('content-length'),
+                                    effective_url=str(response.url.copy_with(query=None)),
+                                    bytes_received=0,
+                                    complete=False)
                                 atomic_json(target.with_suffix('.response.json'),metadata)
                                 with target.open('wb') as f:
                                     # Preserve the actual compressed entity; extraction owns gzip validation.
                                     async for chunk in response.aiter_raw():
-                                        if shutil.disk_usage(target.parent).free<len(chunk)+self.config.execution['min_free_disk_bytes']: raise OSError('Insufficient disk space during download')
-                                        f.write(chunk); received+=len(chunk)
-                                metadata.update(bytes_received=received,complete=True,sha256=digest(target),download_seconds=time.monotonic()-started)
+                                        if shutil.disk_usage(target.parent).free < len(chunk) + self.config.execution['min_free_disk_bytes']: 
+                                            raise OSError('Insufficient disk space during download')
+                                        f.write(chunk)
+                                        received+=len(chunk)
+                                metadata.update(
+                                    bytes_received = received,
+                                    complete = True, 
+                                    sha256 = digest(target),
+                                    download_seconds = time.monotonic()-started
+                                )
                                 atomic_json(target.with_suffix('.response.json'),metadata)
                                 result=target
-                            else: result=await response.aread(); received=len(result)
-                            self.event('download_end',job=key,bytes_received=received,seconds=time.monotonic()-started)
+                            else: 
+                                result = await response.aread()
+                                received=len(result)
+                                
+                            self.event(
+                                'download_end', job = primary_key,
+                                bytes_received = received, 
+                                seconds = time.monotonic()-started
+                            )
+                            
                             if validate:
-                                extract_started=time.monotonic()
-                                task=asyncio.create_task(asyncio.to_thread(validate,result))
-                                try: result=await asyncio.shield(task)
+                                extract_started = time.monotonic()
+                                task = asyncio.create_task(asyncio.to_thread(validate, result))
+                                try: 
+                                    result = await asyncio.shield(task)
                                 except asyncio.CancelledError:
                                     await task
                                     raise
-                                self.event('validation_end',job=key,seconds=time.monotonic()-extract_started)
+                                self.event(
+                                    'validation_end', job = key,
+                                    seconds = time.monotonic() - extract_started
+                                )
                             return result
                         elif code not in (408,429) and code<500:
-                            if code in (401,403): self.stopped.add(service)
-                            self.store.finish(key,'not_found' if code==404 else 'failed',f'http_{code}'); return None
+                            if code in (401,403): 
+                                self.stopped.add(service)
+                            for k in batch_keys:
+                                self.store.finish(
+                                    k,
+                                    'not_found' if code==404 else 'failed',
+                                    f'http_{code}'
+                                )
+                            return None
                 except httpx.TransportError as exc:
-                    code=0; error_code='transport_'+type(exc).__name__
+                    code=0; 
+                    error_code = 'transport_' + type(exc).__name__
                 except httpx.DecodingError:
-                    code=0; error_code='transport_DecodingError'
+                    code=0; 
+                    error_code = 'transport_DecodingError'
                 except ValueError as exc:
-                    code=0; error_code=PAYLOAD_CODES.get(str(exc),'payload_'+type(exc).__name__)
+                    code=0
+                    error_code = PAYLOAD_CODES.get(str(exc),'payload_'+type(exc).__name__)
                 finally:
-                    state['deadline']=max(state['deadline'],self.now()+gap); self.persist()
-                    self.event('request_end',job=key,service=service,status_code=code,error_code=error_code if code==0 else None,bytes_received=received,seconds=time.monotonic()-started)
-                    if self.metrics: self.metrics.sample(force_disk=True)
+                    state['deadline'] = max(state['deadline'], self.now()+gap)
+                    self.persist()
+                    self.event(
+                        'request_end', job=primary_key,
+                        service = service, status_code = code,
+                        error_code = error_code if code == 0 else None,
+                        bytes_received = received,
+                        seconds = time.monotonic()-started
+                    )
+                    if self.metrics:
+                        self.metrics.sample(force_disk=True)
+
                 attempt=self.store.get(key)['attempts']
                 if attempt<3:
                     if not redirected:
-                        delay=net['retry_delays_seconds'][attempt-1]
-                        state['deadline']=max(state['deadline'],self.now()+delay); self.persist()
-                        self.event('retry',job=key,error_code=f'http_{code}' if code else error_code,backoff_seconds=delay)
-                else: self.store.finish(key,'failed',f'http_{code}' if code else error_code)
-            if self.store.get(key)['status'] in ('pending','running'): self.store.finish(key,'failed','attempts_exhausted')
+                        delay = net['retry_delays_seconds'][attempt-1]
+                        state['deadline'] = max(state['deadline'], self.now() + delay)
+                        self.persist()
+                        self.event(
+                            'retry', job=primary_key,
+                            error_code=f'http_{code}' if code else error_code,
+                            backoff_seconds = delay)
+                else:
+                    for k in batch_keys:
+                        self.store.finish(
+                            k, 'failed',
+                            f'http_{code}' if code else error_code)
+            if self.store.get(primary_key)['status'] in ('pending','running'): 
+                self.store.finish(k, 'failed', 'attempts_exhausted')
             return None

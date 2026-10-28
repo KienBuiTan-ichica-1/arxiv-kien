@@ -12,6 +12,7 @@ class ProgressStore:
     def __init__(self,root):
         self.root=Path(root); self.path=self.root/'progress'/'jobs.csv'
         self.lock=threading.RLock(); self.rows={}; self.storage=Storage(root); self.reference_counts={}
+        self.dirty_count = 0
         if self.path.exists() or self.path.with_suffix('.bak').exists() or self.path.with_suffix('.csv.json').exists() or (self.root/'progress/papers.csv').exists() or (self.root/'progress/versions.csv').exists() or (self.root/'progress/backups').exists() or (self.root/'data').exists(): self.load()
     def load(self):
         for path in (self.path,self.path.with_suffix('.bak')):
@@ -39,23 +40,34 @@ class ProgressStore:
                 return
             except (OSError,ValueError,KeyError): continue
         raise RuntimeError('Progress and backup unavailable or corrupt; refusing empty dataset')
-    def save(self):
+    def save(self, with_views=False):
         self.path.parent.mkdir(parents=True,exist_ok=True)
         tmp=self.path.with_suffix('.tmp')
         with tmp.open('w',newline='',encoding='utf8') as f:
-            w=csv.DictWriter(f,fieldnames=self.columns); w.writeheader(); w.writerows(self.rows.values())
-            f.flush(); os.fsync(f.fileno())
+            w=csv.DictWriter(f,fieldnames=self.columns)
+            w.writeheader() 
+            w.writerows(self.rows.values())
+            f.flush()
+            os.fsync(f.fileno())
         valid_current=False
         try:
-            valid_current=digest(self.path)==json.loads(self.path.with_suffix('.csv.json').read_text())['sha256']
-        except (OSError,ValueError,KeyError): pass
+            valid_current = digest(self.path) == json.loads(self.path.with_suffix('.csv.json').read_text())['sha256']
+        except (OSError, ValueError, KeyError): 
+            pass
         if valid_current:
             shutil.copyfile(self.path,self.path.with_suffix('.bak'))
-            shutil.copyfile(self.path.with_suffix('.csv.json'),self.path.with_suffix('.bak.json'))
-        checksum=digest(tmp); tmp.replace(self.path)
-        atomic_json(self.path.with_suffix('.csv.json'),dict(sha256=checksum,count=len(self.rows)))
-        if digest(self.path)!=checksum: raise OSError('CSV readback failed')
-        self.write_views()
+            shutil.copyfile(
+                self.path.with_suffix('.csv.json'),
+                self.path.with_suffix('.bak.json'))
+        checksum=digest(tmp)
+        tmp.replace(self.path)
+        atomic_json(
+            self.path.with_suffix('.csv.json'),
+            dict(sha256=checksum,count=len(self.rows)))
+        if digest(self.path) != checksum: 
+            raise OSError('CSV readback failed')
+        if with_views:
+            self.write_views()
     def add(self,key):
         if key not in self.rows:
             paper,version,stage,offset=key
@@ -63,8 +75,9 @@ class ProgressStore:
     def initialize(self,ids):
         with self.lock:
             for paper in ids:
-                for stage in ('discovery','references'): self.add((paper,0,stage,0))
-            self.save()
+                for stage in ('discovery','references'): 
+                    self.add((paper,0,stage,0))
+            self.save(with_views=True)
     def get(self,key): return self.rows[key]
     def pending(self,stage):
         return [k for k,r in self.rows.items() if k[2]==stage and r['status'] in ('pending','running') and r['attempts']<3]
@@ -77,7 +90,15 @@ class ProgressStore:
             self.save()
     def finish(self,key,status,error=''):
         with self.lock:
-            self.rows[key].update(status=status,error=error); self.save()
+            self.rows[key].update(status=status,error=error)
+            self.dirty_count += 1
+            
+            # Cứ mỗi 50 tasks hoàn tất mới cập nhật papers.csv/versions.csv một lần
+            if self.dirty_count >= 50: 
+                self.save(with_views=True)
+                self.dirty_count = 0
+            else: 
+                self.save(with_views=False)
     def reconcile(self,recover_running=True):
         with self.lock:
             for key,row in list(self.rows.items()):
@@ -100,7 +121,7 @@ class ProgressStore:
                         attempts=0 if finished else self.rows.get((key[0],0,'references',next_offset),{}).get('attempts',0)
                     row['status']='pending' if attempts<3 else 'failed'
                     row['error']='integrity_missing_result'
-            self.save()
+            self.save(with_views=True)
     def reset(self,status='failed',stages=None,ids=None):
         with self.lock:
             retry_papers={k[0] for k,r in self.rows.items() if k[2]=='references' and k[3]==0 and r['status']==status}

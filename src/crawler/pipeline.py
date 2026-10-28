@@ -15,7 +15,7 @@ from .progress import ProgressStore
 from .storage import atomic_json, digest
 from .scheduler import Scheduler
 from .secrets import load_semantic_scholar_key
-from .arxiv_client import parse_atom
+from .arxiv_client import parse_atom, parse_atom_batch
 from .semantic_scholar import parse_page,FIELDS
 from .sources import inspect_and_extract
 
@@ -50,14 +50,23 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
         before=time.monotonic(); store.storage.commit(key,staging); store.reconcile(recover_running=False)
         metrics.record('commit',job=key,seconds=time.monotonic()-before)
     async def arxiv(scheduler):
-        discovery_turn=True
-        discovery_queue=asyncio.Queue(maxsize=config.execution['queue_capacity'])
-        version_queue=asyncio.Queue(maxsize=config.execution['queue_capacity'])
+        discovery_turn = True
+        discovery_queue = asyncio.Queue(maxsize=config.execution['queue_capacity'])
+        version_queue = asyncio.Queue(maxsize=config.execution['queue_capacity'])
         while 'arxiv' not in scheduler.stopped:
+            pending_discoveries = [
+                k for k in store.pending("discovery") if k[0] in selected
+            ]
+            if pending_discoveries:
+                # Lấy 1 batch tối đa 50 ID
+                batch = pending_discoveries[:50]
+                await run_discovery_batch(batch, scheduler)
+                continue  # Xong 1 batch discovery thì quay lại vòng lặp
             if discovery_queue.empty():
                 for key in (k for k in store.pending('discovery') if k[0] in selected):
                     discovery_queue.put_nowait(key)
-                    if discovery_queue.full(): break
+                    if discovery_queue.full(): 
+                        break
             if version_queue.empty():
                 keys=sorted([k for stage in ('metadata','source') for k in store.pending(stage) if k[0] in selected],key=lambda k:(k[0],k[1],k[2]=='source'))
                 for key in keys[:config.execution['queue_capacity']]: version_queue.put_nowait(key)
@@ -121,6 +130,37 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
                     metrics.record('commit',job=base,seconds=time.monotonic()-before)
                     break
                 offset=page['next']
+                
+    async def run_discovery_batch(batch_keys, scheduler):
+        papers = [k[0] for k in batch_keys]
+        id_list = ",".join(papers)
+        # Quan trọng: arXiv mặc định max_results=10, nên phải truyền max_results=len(papers)
+        raw = await scheduler.request(
+            batch_keys,
+            "arxiv",
+            "https://export.arxiv.org/api/query",
+            params={"id_list": id_list, "max_results": len(papers)},
+            validate=lambda raw: (raw, parse_atom_batch(raw, papers)),
+        )
+        if raw is None:
+            return
+        raw, batch_parsed = raw
+        for key in batch_keys:
+            paper = key[0]
+            parsed = batch_parsed.get(paper, {"not_found": True})
+            if parsed.get("not_found"):
+                store.finish(key, "not_found")
+                continue
+            staging = scratch / f'{quote(paper, safe="")}-discovery'
+            staging.mkdir(parents=True, exist_ok=True)
+            atomic_json(staging / "normalized.json", parsed)
+            store.storage.commit(key, staging)
+            store.finish(key, "succeeded")
+            # Sinh các version jobs v1..vN cho bài vừa tìm thấy
+            for v in range(1, parsed["version"] + 1):
+                for stage in ("metadata", "source"):
+                    store.add((paper, v, stage, 0))
+        store.save(with_views=False)
     completed=False
     try:
         timeout=httpx.Timeout(config.network['read_timeout_seconds'],connect=config.network['connect_timeout_seconds'])
@@ -133,7 +173,9 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
     finally:
         monitor.cancel()
         try: await monitor
-        except asyncio.CancelledError: pass
+        except asyncio.CancelledError: 
+            pass
+        store.save(with_views=True)
         summary=metrics.stop(store,incomplete=not completed)
         summary['jobs']=len(store.rows)
     return summary
