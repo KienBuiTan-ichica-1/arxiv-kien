@@ -31,6 +31,8 @@ smoke bản cập nhật. Mỗi run tự lưu phiên bản package trong environ
 
 ## Dữ liệu và tương thích với bản đầu
 
+Giải thích chi tiết từng file: [docs/runtime-files.md](docs/runtime-files.md).
+
 - `runtime/progress/jobs.csv`: snapshot progress; `jobs.journal.jsonl` giữ các
   cập nhật mới hơn snapshot. Resume dùng cả hai, giữ tương thích dữ liệu cũ.
   Không xóa/sửa tay journal hoặc hạ code về bản không đọc journal.
