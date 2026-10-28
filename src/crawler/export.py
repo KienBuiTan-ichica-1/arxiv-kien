@@ -21,7 +21,8 @@ def _export_snapshot(config,run_id):
     for key in sorted(store.rows):
         if key[2]!='discovery': continue
         paper=key[0]; meta={}; revisions=[]
-        if store.storage.verify(key): meta=json.loads((store.storage.result_dir(key)/'normalized.json').read_text())
+        marker=store.storage.verify(key)
+        if marker and marker['status']=='succeeded': meta=json.loads((store.storage.result_dir(key)/'normalized.json').read_text())
         else: missing+=1
         for version in range(2,meta.get('version',0)+1):
             vkey=(paper,version,'metadata',0)

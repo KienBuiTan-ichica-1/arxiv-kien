@@ -23,8 +23,9 @@ def test_source_truncation_three_attempts_then_resume(tmp_path,monkeypatch):
         if request.url.path.startswith('/src/'):
             data=archive[:-6] if '02523' in request.url.path else archive
             return httpx.Response(200,stream=Body(data))
-        paper=request.url.params['id_list'].removesuffix('v1')
-        return httpx.Response(200,content=f'<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/{paper}v1</id><title>T</title></entry></feed>'.encode())
+        papers=request.url.params['id_list'].split(',')
+        entries=''.join(f'<entry><id>http://arxiv.org/abs/{paper.removesuffix("v1")}v1</id><title>T</title></entry>' for paper in papers)
+        return httpx.Response(200,content=f'<feed xmlns="http://www.w3.org/2005/Atom">{entries}</feed>'.encode())
     result=asyncio.run(run_pipeline(c,limit=2,transport=httpx.MockTransport(handler),now=lambda:clock[0],sleep=sleep))
     store=ProgressStore('runtime')
     assert store.get(('2504.02523',1,'source',0))['error']=='payload_gzip_truncated'

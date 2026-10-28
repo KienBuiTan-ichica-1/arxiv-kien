@@ -6,6 +6,8 @@ range:
   end_id: 7522
 paths:
   persistent_root: runtime
-  scratch_root: /tmp/crawler_scratch
+  scratch_root: runtime/temp
+network:
+  discovery_batch_size: 50
 execution:
   allow_anonymous_s2: true

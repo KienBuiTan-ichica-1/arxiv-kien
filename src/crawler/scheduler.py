@@ -20,46 +20,53 @@ class Scheduler:
     def event(self,name,**fields):
         if self.metrics: self.metrics.record(name,**fields)
     def persist(self): atomic_json(self.path,self.state)
-    async def wait(self,deadline,job=None,reason='service_cooldown'):
+    async def wait(self,deadline,job=None,reason='service_cooldown',jobs=None):
         while self.now()<deadline:
             duration=min(30,deadline-self.now())
-            self.event('waiting',job=job,reason=reason,remaining_seconds=deadline-self.now())
+            self.event('waiting',job=job,jobs=jobs,reason=reason,remaining_seconds=deadline-self.now())
             before=time.monotonic()
             await self.sleep(duration)
-            self.event('wait_end',job=job,reason=reason,seconds=time.monotonic()-before)
+            self.event('wait_end',job=job,jobs=jobs,reason=reason,seconds=time.monotonic()-before)
     async def request(self, key, service, url, params=None, target=None, validate=None):
-        if service in self.stopped: 
+        if service in self.stopped:
             return None
         expected_host = 'export.arxiv.org' if service=='arxiv' else 'api.semanticscholar.org'
         if urlsplit(url).hostname != expected_host or urlsplit(url).scheme!='https': raise ValueError('Disallowed service URL')
         net=self.config.network; state=self.state[service]
         gap = net['arxiv_gap_seconds'] if service == 'arxiv' else net['s2_key_gap_seconds' if self.api_key else 's2_anonymous_gap_seconds']
         queued = time.monotonic()
-        
+
         batch_keys = key if isinstance(key, list) else [key]
+        if not batch_keys or len(set(batch_keys))!=len(batch_keys): raise ValueError('Expected distinct job keys')
+        attempts={self.store.get(k)['attempts'] for k in batch_keys}
+        if len(attempts)!=1: raise ValueError('Batch members must have the same attempt count')
+        if len(batch_keys)>1 and (service!='arxiv' or any(k[2]!='discovery' for k in batch_keys)):
+            raise ValueError('Batch requests support discovery only')
         primary_key = batch_keys[0]
-        
+        def emit(name,**fields):
+            fields.pop('job',None)
+            self.event(name,job=primary_key,jobs=batch_keys,**fields)
+
         async with self.locks[service]:
-            self.event('queue_acquired',job = primary_key,seconds=time.monotonic()-queued)
+            emit('queue_acquired',job = primary_key,seconds=time.monotonic()-queued)
             while self.store.get(primary_key)['attempts']<3:
                 state['recent'] = [
-                    t for t in state['recent'] 
+                    t for t in state['recent']
                     if t > self.now()-net['s2_anonymous_window_seconds']]
                 deadline = state['deadline']
                 if service == 's2' and not self.api_key and len(state['recent'])>=net['s2_anonymous_window_requests']:
                     deadline = max(
                         deadline, state['recent'][0] + net['s2_anonymous_window_seconds'])
-                await self.wait(deadline, primary_key)
-                for k in batch_keys: 
-                    self.store.start_attempt(k)
-                if service == 's2': 
+                await self.wait(deadline, primary_key,jobs=batch_keys)
+                self.store.start_attempts(batch_keys)
+                if service == 's2':
                     state['recent'].append(self.now())
                 self.persist()
                 headers={'User-Agent':net['user_agent']}
                 if service=='s2' and self.api_key: headers['x-api-key']=self.api_key
                 code=0; error_code='unknown'; received=0; redirected=False
                 started=time.monotonic()
-                self.event('request_start',job = primary_key, service=service,attempt=self.store.get(primary_key)['attempts'])
+                emit('request_start',job = primary_key, service=service,attempt=self.store.get(primary_key)['attempts'])
                 try:
                     async with self.client.stream('GET',url,params=params,headers=headers,follow_redirects=False) as response:
                         code=response.status_code
@@ -69,19 +76,18 @@ class Scheduler:
                             state['deadline'] = max(state['deadline'],self.now()+(retry_after if retry_after is not None else state['backoff']))
                         else:
                             state['backoff'] = 0
-                            if retry_after is not None: 
+                            if retry_after is not None:
                                 state['deadline'] = max(state['deadline'],self.now()+  retry_after)
                         self.persist()
-                        
+
                         if code in (301, 302, 303, 307, 308):
                             location=response.headers.get('Location','')
                             redirect=urljoin(str(response.url),location)
                             parsed=urlsplit(redirect)
                             if not location or parsed.scheme!='https' or parsed.hostname!=expected_host or parsed.username or parsed.password:
-                                for k in batch_keys:
-                                    self.store.finish(k,'failed','redirect_disallowed') 
+                                self.store.finish_many([(k,'failed','redirect_disallowed') for k in batch_keys])
                                 return None
-                            self.event('redirect',job=primary_key,host=parsed.hostname)
+                            emit('redirect',job=primary_key,host=parsed.hostname)
                             url=redirect; params=None; redirected=True
                         elif code==200:
                             if target:
@@ -98,56 +104,51 @@ class Scheduler:
                                 with target.open('wb') as f:
                                     # Preserve the actual compressed entity; extraction owns gzip validation.
                                     async for chunk in response.aiter_raw():
-                                        if shutil.disk_usage(target.parent).free < len(chunk) + self.config.execution['min_free_disk_bytes']: 
+                                        if shutil.disk_usage(target.parent).free < len(chunk) + self.config.execution['min_free_disk_bytes']:
                                             raise OSError('Insufficient disk space during download')
                                         f.write(chunk)
                                         received+=len(chunk)
                                 metadata.update(
                                     bytes_received = received,
-                                    complete = True, 
+                                    complete = True,
                                     sha256 = digest(target),
                                     download_seconds = time.monotonic()-started
                                 )
                                 atomic_json(target.with_suffix('.response.json'),metadata)
                                 result=target
-                            else: 
+                            else:
                                 result = await response.aread()
                                 received=len(result)
-                                
-                            self.event(
+
+                            emit(
                                 'download_end', job = primary_key,
-                                bytes_received = received, 
+                                bytes_received = received,
                                 seconds = time.monotonic()-started
                             )
-                            
+
                             if validate:
                                 extract_started = time.monotonic()
                                 task = asyncio.create_task(asyncio.to_thread(validate, result))
-                                try: 
+                                try:
                                     result = await asyncio.shield(task)
                                 except asyncio.CancelledError:
                                     await task
                                     raise
-                                self.event(
+                                emit(
                                     'validation_end', job = key,
                                     seconds = time.monotonic() - extract_started
                                 )
                             return result
                         elif code not in (408,429) and code<500:
-                            if code in (401,403): 
+                            if code in (401,403):
                                 self.stopped.add(service)
-                            for k in batch_keys:
-                                self.store.finish(
-                                    k,
-                                    'not_found' if code==404 else 'failed',
-                                    f'http_{code}'
-                                )
+                            self.store.finish_many([(k,'not_found' if code==404 else 'failed',f'http_{code}') for k in batch_keys])
                             return None
                 except httpx.TransportError as exc:
-                    code=0; 
+                    code=0;
                     error_code = 'transport_' + type(exc).__name__
                 except httpx.DecodingError:
-                    code=0; 
+                    code=0;
                     error_code = 'transport_DecodingError'
                 except ValueError as exc:
                     code=0
@@ -155,7 +156,7 @@ class Scheduler:
                 finally:
                     state['deadline'] = max(state['deadline'], self.now()+gap)
                     self.persist()
-                    self.event(
+                    emit(
                         'request_end', job=primary_key,
                         service = service, status_code = code,
                         error_code = error_code if code == 0 else None,
@@ -165,21 +166,18 @@ class Scheduler:
                     if self.metrics:
                         self.metrics.sample(force_disk=True)
 
-                attempt=self.store.get(key)['attempts']
+                attempt=self.store.get(primary_key)['attempts']
                 if attempt<3:
                     if not redirected:
                         delay = net['retry_delays_seconds'][attempt-1]
                         state['deadline'] = max(state['deadline'], self.now() + delay)
                         self.persist()
-                        self.event(
+                        emit(
                             'retry', job=primary_key,
                             error_code=f'http_{code}' if code else error_code,
                             backoff_seconds = delay)
                 else:
-                    for k in batch_keys:
-                        self.store.finish(
-                            k, 'failed',
-                            f'http_{code}' if code else error_code)
-            if self.store.get(primary_key)['status'] in ('pending','running'): 
-                self.store.finish(k, 'failed', 'attempts_exhausted')
+                    self.store.finish_many([(k,'failed',f'http_{code}' if code else error_code) for k in batch_keys])
+            unfinished=[(k,'failed','attempts_exhausted') for k in batch_keys if self.store.get(k)['status'] in ('pending','running')]
+            if unfinished: self.store.finish_many(unfinished)
             return None

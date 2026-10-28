@@ -51,8 +51,8 @@ class MetricsRecorder:
         row=dict(event=event,run_id=self.run_id,utc=utc_now(),elapsed_seconds=time.monotonic()-self.started,**fields)
         self.log.write(json.dumps(row,ensure_ascii=False)+'\n'); self.log.flush()
         if 'seconds' in fields: self.durations[event]=self.durations.get(event,0)+fields['seconds']
-        job=fields.get('job')
-        if job:
+        jobs=fields.get('jobs') or ([fields['job']] if fields.get('job') else [])
+        for job in jobs:
             self.paper_start.setdefault(job[0],row['elapsed_seconds'])
             self.paper_end[job[0]]=row['elapsed_seconds']
     def sample(self,force_disk=False):

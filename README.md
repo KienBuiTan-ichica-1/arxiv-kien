@@ -108,3 +108,30 @@ redirect sang host khác ghi `redirect_disallowed`, không âm thầm dùng main
 
 Code repo và Drive runtime độc lập; parsing, matching, Jupyter Book, GitHub Pages,
 upload dataset và report repo thuộc milestone sau. Chưa chạy toàn bộ 5.000 ID.
+
+## Discovery batching
+
+`network.discovery_batch_size` mặc định 50 (1–50), giới hạn thêm bởi
+`execution.queue_capacity`. Pipeline luân phiên một batch discovery và một
+version stage; metadata riêng từng version và source vẫn qua cùng scheduler.
+Batch chỉ gom các ID đang pending/running có cùng cycle-attempt count. Mỗi
+request tiêu thụ một attempt của từng ID tham gia, checkpoint cả nhóm một lần
+trước khi gửi; không reset attempts khi chia/gom batch hoặc restart. Nhóm có
+attempts khác nhau được xử lý riêng để mỗi ID giữ tối đa ba attempts/chu kỳ.
+
+Atom error, ID ngoài batch, duplicate hoặc response có totalResults không khớp
+không được biến thành not_found. Raw response và request ID list được lưu với
+mỗi discovery result. Recovery tái tạo version rows từ marker nếu runtime chết
+trước terminal checkpoint. Metrics ghi danh sách jobs của batch, chỉ cộng thời
+gian request một lần.
+
+`papers.csv`/`versions.csv` là views có thể trễ tối đa 49 terminal mutations;
+`jobs.csv` vẫn checkpoint mỗi request hoặc terminal batch. Dùng CLI status hoặc
+`status_counts()` khi đang chạy. Views được flush ở cuối phiên và reconcile.
+
+Notebook `5000_crawl.ipynb` mặc định smoke 10 ID. Muốn dùng SSD, notebook tạo
+project path tương đối `scratch` là symlink đến thư mục tạm do hệ điều hành cấp;
+config/log không lưu mount path hoặc đường dẫn SSD tuyệt đối. Khi runtime reset,
+link hỏng được tạo lại, staging dở tải lại từ đầu, kết quả complete nằm trên Drive.
+Sau cập nhật code cần restart kernel trước khi import lại crawler. Chỉ bật
+`RUN_FULL_RANGE=True` sau khi smoke mới và interrupt/resume đã đạt.

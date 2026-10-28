@@ -51,30 +51,21 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
         metrics.record('commit',job=key,seconds=time.monotonic()-before)
     async def arxiv(scheduler):
         discovery_turn = True
-        discovery_queue = asyncio.Queue(maxsize=config.execution['queue_capacity'])
-        version_queue = asyncio.Queue(maxsize=config.execution['queue_capacity'])
         while 'arxiv' not in scheduler.stopped:
-            pending_discoveries = [
-                k for k in store.pending("discovery") if k[0] in selected
-            ]
-            if pending_discoveries:
-                # Lấy 1 batch tối đa 50 ID
-                batch = pending_discoveries[:50]
-                await run_discovery_batch(batch, scheduler)
-                continue  # Xong 1 batch discovery thì quay lại vòng lặp
-            if discovery_queue.empty():
-                for key in (k for k in store.pending('discovery') if k[0] in selected):
-                    discovery_queue.put_nowait(key)
-                    if discovery_queue.full(): 
-                        break
-            if version_queue.empty():
-                keys=sorted([k for stage in ('metadata','source') for k in store.pending(stage) if k[0] in selected],key=lambda k:(k[0],k[1],k[2]=='source'))
-                for key in keys[:config.execution['queue_capacity']]: version_queue.put_nowait(key)
-            discoveries=not discovery_queue.empty(); versions=not version_queue.empty()
+            discoveries=[k for k in store.pending('discovery') if k[0] in selected]
+            versions=sorted([k for stage in ('metadata','source') for k in store.pending(stage) if k[0] in selected],key=lambda k:(k[0],k[1],k[2]=='source'))
             if not discoveries and not versions: break
             if discoveries and (discovery_turn or not versions):
-                key=discovery_queue.get_nowait(); discovery_turn=False
-            else: key=version_queue.get_nowait(); discovery_turn=True
+                # Regroup after restart by remaining budget. Never reset attempts
+                # to make a new batch: all members must be eligible for every send.
+                attempts=store.get(discoveries[0])['attempts']
+                size=min(config.network['discovery_batch_size'],config.execution['queue_capacity'])
+                batch=[k for k in discoveries if store.get(k)['attempts']==attempts][:size]
+                await run_discovery_batch(batch,scheduler)
+                discovery_turn=False
+                continue
+            key=versions[0]
+            discovery_turn=True
             if key[2]!='source': await metadata(key,scheduler); continue
             archive=scratch/f'{quote(key[0],safe="")}v{key[1]}.download'
             staging=scratch/f'{quote(key[0],safe="")}v{key[1]}-source'
@@ -145,22 +136,24 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
         if raw is None:
             return
         raw, batch_parsed = raw
+        results=[]
         for key in batch_keys:
-            paper = key[0]
-            parsed = batch_parsed.get(paper, {"not_found": True})
-            if parsed.get("not_found"):
-                store.finish(key, "not_found")
-                continue
-            staging = scratch / f'{quote(paper, safe="")}-discovery'
-            staging.mkdir(parents=True, exist_ok=True)
-            atomic_json(staging / "normalized.json", parsed)
-            store.storage.commit(key, staging)
-            store.finish(key, "succeeded")
-            # Sinh các version jobs v1..vN cho bài vừa tìm thấy
-            for v in range(1, parsed["version"] + 1):
-                for stage in ("metadata", "source"):
-                    store.add((paper, v, stage, 0))
-        store.save(with_views=False)
+            paper=key[0]; parsed=batch_parsed[paper]
+            staging=scratch/f'{quote(paper,safe="")}-discovery'
+            staging.mkdir(parents=True,exist_ok=True)
+            (staging/'response.xml').write_bytes(raw)
+            atomic_json(staging/'request.json',dict(id_list=papers,max_results=len(papers)))
+            atomic_json(staging/'normalized.json',parsed)
+            before=time.monotonic()
+            status='not_found' if parsed.get('not_found') else 'succeeded'
+            store.storage.commit(key,staging,status)
+            # Marker first, then version rows, then terminal CSV state. Recovery
+            # reconstructs missing rows from any valid discovery marker.
+            for version in range(1,parsed.get('version',0)+1):
+                for stage in ('metadata','source'): store.add((paper,version,stage,0))
+            metrics.record('commit',job=key,seconds=time.monotonic()-before)
+            results.append((key,status,''))
+        store.finish_many(results)
     completed=False
     try:
         timeout=httpx.Timeout(config.network['read_timeout_seconds'],connect=config.network['connect_timeout_seconds'])

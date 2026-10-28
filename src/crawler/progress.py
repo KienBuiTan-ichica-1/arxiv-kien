@@ -82,23 +82,35 @@ class ProgressStore:
     def pending(self,stage):
         return [k for k,r in self.rows.items() if k[2]==stage and r['status'] in ('pending','running') and r['attempts']<3]
     def start_attempt(self,key):
+        self.start_attempts([key])
+
+    def start_attempts(self,keys):
+        """Validate all keys before one durable pre-send checkpoint."""
         with self.lock:
-            row=self.rows[key]
-            if row['attempts']>=3: raise RuntimeError('Attempt budget exhausted')
-            row['attempts']+=1; row['total']+=1; row['status']='running'
-            if key[2]=='references': self.rows[(key[0],0,'references',0)]['status']='running'
+            if not keys or len(set(keys))!=len(keys): raise ValueError('Expected distinct job keys')
+            for key in keys:
+                row=self.rows[key]
+                if row['attempts']>=3: raise RuntimeError('Attempt budget exhausted')
+                if row['status'] not in ('pending','running'): raise ValueError('Cannot send terminal job')
+            for key in keys:
+                row=self.rows[key]
+                row['attempts']+=1; row['total']+=1; row['status']='running'
+                if key[2]=='references': self.rows[(key[0],0,'references',0)]['status']='running'
             self.save()
+
     def finish(self,key,status,error=''):
+        self.finish_many([(key,status,error)])
+
+    def finish_many(self,results):
         with self.lock:
-            self.rows[key].update(status=status,error=error)
-            self.dirty_count += 1
-            
-            # Cứ mỗi 50 tasks hoàn tất mới cập nhật papers.csv/versions.csv một lần
-            if self.dirty_count >= 50: 
-                self.save(with_views=True)
-                self.dirty_count = 0
-            else: 
-                self.save(with_views=False)
+            for key,status,error in results:
+                if key not in self.rows: raise KeyError(key)
+            for key,status,error in results: self.rows[key].update(status=status,error=error)
+            self.dirty_count+=len(results)
+            with_views=self.dirty_count>=50
+            self.save(with_views=with_views)
+            if with_views: self.dirty_count=0
+
     def reconcile(self,recover_running=True):
         with self.lock:
             for key,row in list(self.rows.items()):
@@ -110,7 +122,7 @@ class ProgressStore:
                     row['status']=marker['status']
                     if key[2]=='references':
                         self.reference_counts[key[0]]=len(json.loads((self.storage.result_dir(key)/'normalized.json').read_text())['references'])
-                    if key[2]=='discovery':
+                    if key[2]=='discovery' and marker['status']=='succeeded':
                         meta=json.loads((self.storage.result_dir(key)/'normalized.json').read_text())
                         for v in range(1,meta['version']+1):
                             for stage in ('metadata','source'): self.add((key[0],v,stage,0))
@@ -129,6 +141,7 @@ class ProgressStore:
                 if stages and key[2] not in stages: continue
                 if ids is not None and key[0] not in ids: continue
                 if row['status']==status or (key[2]=='references' and key[0] in retry_papers and (row['status']!='succeeded' or not self.valid_reference_page(key[0],key[3]))):
+                    if status=='not_found' and key[2]=='discovery': self.storage.archive_result(key)
                     row.update(status='pending',attempts=0,cycle=row['cycle']+1,error='')
             self.save()
 
