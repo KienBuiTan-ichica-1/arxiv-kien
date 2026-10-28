@@ -1,0 +1,11 @@
+schema_version: 1
+range:
+  start_month: '2025-04'
+  start_id: 2523
+  end_month: '2025-04'
+  end_id: 7522
+paths:
+  persistent_root: runtime
+  scratch_root: runtime/temp
+execution:
+  allow_anonymous_s2: true

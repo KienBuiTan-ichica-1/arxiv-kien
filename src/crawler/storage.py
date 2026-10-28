@@ -1,0 +1,52 @@
+"""Verified JSON publication and checksummed result manifests."""
+import hashlib
+import json
+import os
+import shutil
+from pathlib import Path
+from urllib.parse import quote
+
+def digest(path):
+    h=hashlib.sha256()
+    with Path(path).open('rb') as f:
+        for chunk in iter(lambda:f.read(1024*1024),b''): h.update(chunk)
+    return h.hexdigest()
+
+def atomic_json(path,value):
+    path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
+    tmp=path.with_suffix(path.suffix+'.tmp')
+    with tmp.open('w',encoding='utf8') as f:
+        json.dump(value,f,ensure_ascii=False,sort_keys=True); f.flush(); os.fsync(f.fileno())
+    assert json.loads(tmp.read_text())==value
+    tmp.replace(path)
+    if json.loads(path.read_text())!=value: raise OSError('Publication verification failed')
+
+class Storage:
+    def __init__(self,root): self.root=Path(root)
+    def paper_dir(self,paper): return self.root/'data'/quote(paper,safe='')
+    def result_dir(self,key):
+        paper,version,stage,_=key
+        base=self.paper_dir(paper)
+        return base/'versions'/f'v{version}'/stage if version else base/stage
+    def commit(self,key,staging,status='succeeded'):
+        target=self.result_dir(key); target.mkdir(parents=True,exist_ok=True)
+        marker=target/'complete.json'
+        if marker.exists(): marker.unlink()
+        hashes={}
+        for source in Path(staging).rglob('*'):
+            if source.is_file() and source.name!='complete.json':
+                rel=source.relative_to(staging); dest=target/rel
+                dest.parent.mkdir(parents=True,exist_ok=True); shutil.copyfile(source,dest)
+                hashes[rel.as_posix()]=digest(source)
+                if digest(dest)!=hashes[rel.as_posix()]: raise OSError('Checksum mismatch')
+        atomic_json(marker,dict(schema_version=1,key=list(key),status=status,checksums=hashes))
+    def verify(self,key):
+        target=self.result_dir(key)
+        try:
+            marker=json.loads((target/'complete.json').read_text())
+            if marker['key']!=list(key): return None
+            for name,checksum in marker['checksums'].items():
+                p=Path(name)
+                if p.is_absolute() or '..' in p.parts or digest(target/p)!=checksum: return None
+            return marker
+        except (OSError,ValueError,KeyError): return None

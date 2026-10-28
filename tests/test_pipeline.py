@@ -1,0 +1,33 @@
+import asyncio
+import httpx
+from crawler.config import CrawlerConfig
+from crawler.pipeline import run_pipeline
+
+def test_broadcast(tmp_path,monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    c=CrawlerConfig(); c.range['end_id']=2523
+    seen=[]
+    def handler(request):
+        seen.append(request.url.host)
+        return httpx.Response(404)
+    result=asyncio.run(run_pipeline(c,{'arxiv','s2'},False,limit=1,transport=httpx.MockTransport(handler)))
+    assert set(seen)=={'export.arxiv.org','api.semanticscholar.org'}
+    assert result['jobs']==2
+
+def test_reference_page_resume(tmp_path,monkeypatch):
+    import json
+    from crawler.progress import ProgressStore
+    monkeypatch.chdir(tmp_path)
+    c=CrawlerConfig(); c.range['end_id']=2523
+    calls=[]
+    def handler(request):
+        offset=int(request.url.params['offset']); calls.append(offset)
+        if offset==0: return httpx.Response(200,json={'data':[],'next':100})
+        raise RuntimeError('simulated session interruption')
+    try: asyncio.run(run_pipeline(c,{'s2'},limit=1,transport=httpx.MockTransport(handler)))
+    except ExceptionGroup: pass
+    def finish(request):
+        calls.append(int(request.url.params['offset']))
+        return httpx.Response(200,json={'data':[]})
+    asyncio.run(run_pipeline(c,{'s2'},limit=1,transport=httpx.MockTransport(finish)))
+    assert calls.count(0)==1
