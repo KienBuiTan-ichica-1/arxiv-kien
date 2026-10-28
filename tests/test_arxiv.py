@@ -7,3 +7,7 @@ def test_version():
 def test_html_is_not_missing():
     import pytest
     with pytest.raises(ValueError): parse_atom(b'<html><body>error</body></html>','2504.02523')
+
+def test_broken_xml_is_payload_error():
+    import pytest
+    with pytest.raises(ValueError): parse_atom(b'<feed','2504.02523')

@@ -32,19 +32,24 @@ def inspect_and_extract(archive,staging,config):
                     count+=len(chunk)
                     if count>limits['max_unpacked_bytes']: raise RuntimeError('resource_limit')
                     dst.write(chunk)
-        except (EOFError,gzip.BadGzipFile,zlib.error) as exc: raise ValueError('Invalid gzip') from exc
+        except EOFError as exc: raise ValueError('Truncated gzip') from exc
+        except (gzip.BadGzipFile,zlib.error) as exc: raise ValueError('Invalid gzip') from exc
         payload=inflated
     if tarfile.is_tarfile(payload):
         try:
             with tarfile.open(payload,'r:') as tar:
                 for member in tar:
+                    member_path=PurePosixPath(member.name)
+                    if member_path.is_absolute() or '..' in member_path.parts or '\\' in member.name: raise ValueError('Unsafe archive member')
                     if member.isdir(): continue
                     if not member.isfile(): raise ValueError('Non-regular archive member')
                     with tar.extractfile(member) as reader: save(member.name,reader,member.size)
         except tarfile.TarError as exc: raise ValueError('Invalid tar') from exc
     else:
         with payload.open('rb') as f: prefix=f.read(65536)
-        if prefix.startswith(b'%PDF-'): total=payload.stat().st_size; discarded=1
+        if prefix.startswith(b'%PDF-'):
+            total=payload.stat().st_size; discarded=1
+            if total>min(limits['max_member_bytes'],limits['max_unpacked_bytes']): raise RuntimeError('resource_limit')
         elif any(token in prefix for token in (b'\\documentclass',b'\\documentstyle',b'\\begin{document}',b'\\input',b'\\def')) and b'<html' not in prefix.lower():
             with payload.open('rb') as f: save('source.tex',f,payload.stat().st_size)
         else: raise ValueError('Unrecognized source payload')

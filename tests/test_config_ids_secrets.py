@@ -20,3 +20,16 @@ def test_config(tmp_path):
 def test_key(monkeypatch):
     monkeypatch.setenv('SEMANTIC_SCHOLAR_API_KEY',' secret ')
     assert load_semantic_scholar_key()=='secret'
+
+def test_colab_denied_is_not_absent(monkeypatch):
+    import sys,types
+    class Missing(Exception): pass
+    class Denied(Exception): pass
+    def get(name): raise Denied()
+    userdata=types.SimpleNamespace(get=get,SecretNotFoundError=Missing,NotebookAccessError=Denied)
+    monkeypatch.delenv('SEMANTIC_SCHOLAR_API_KEY',raising=False)
+    monkeypatch.setitem(sys.modules,'google.colab',types.SimpleNamespace(userdata=userdata))
+    with pytest.raises(RuntimeError,match='Enable notebook access'): load_semantic_scholar_key()
+    def missing(name): raise Missing()
+    userdata.get=missing
+    assert load_semantic_scholar_key() is None

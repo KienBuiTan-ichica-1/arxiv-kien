@@ -12,3 +12,6 @@ def test_missing_metadata_retains_id(tmp_path,monkeypatch):
     assert table.to_pylist()[0]['arxiv_id']=='2504.02523'
     assert table.to_pylist()[0]['title'] is None
     assert manifest['papers']==1
+    assert (tmp_path/'runtime/exports/test-run/paper_metrics.csv').exists()
+    assert (tmp_path/'runtime/exports/test-run/version_metrics.csv').exists()
+    assert manifest['input_fingerprint']

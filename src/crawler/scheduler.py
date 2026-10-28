@@ -1,67 +1,116 @@
+"""Single-flight service schedulers with durable attempt and cooldown accounting."""
 import asyncio
 import json
+import shutil
 import time
 from datetime import datetime, timezone
+from urllib.parse import urljoin, urlsplit
 import httpx
 from .retry import parse_retry_after
-from .storage import atomic_json
+from .storage import atomic_json, digest
+
+PAYLOAD_CODES={'Truncated gzip':'payload_gzip_truncated','Unrecognized source payload':'payload_unrecognized','Invalid gzip':'payload_invalid_gzip','Invalid tar':'payload_invalid_tar','Unsafe archive member':'payload_unsafe_member','Non-regular archive member':'payload_nonregular_member','Truncated archive member':'payload_truncated_member'}
 
 class Scheduler:
-    def __init__(self,config,store,client,now=time.time,sleep=asyncio.sleep,api_key=None):
-        self.config=config; self.store=store; self.client=client; self.now=now; self.sleep=sleep; self.api_key=api_key
+    def __init__(self,config,store,client,now=time.time,sleep=asyncio.sleep,api_key=None,metrics=None):
+        self.config=config; self.store=store; self.client=client; self.now=now; self.sleep=sleep; self.api_key=api_key; self.metrics=metrics
         self.path=store.root/'progress'/'services.json'
         self.state=json.loads(self.path.read_text()) if self.path.exists() else {s:dict(deadline=0,backoff=0,recent=[]) for s in ('arxiv','s2')}
-        self.locks={s:asyncio.Lock() for s in self.state}; self.stopped=set()
+        self.locks={s:asyncio.Lock() for s in ('arxiv','s2')}; self.stopped=set()
+    def event(self,name,**fields):
+        if self.metrics: self.metrics.record(name,**fields)
     def persist(self): atomic_json(self.path,self.state)
-    async def wait(self,deadline):
-        while self.now()<deadline: await self.sleep(min(30,deadline-self.now()))
+    async def wait(self,deadline,job=None,reason='service_cooldown'):
+        while self.now()<deadline:
+            duration=min(30,deadline-self.now())
+            self.event('waiting',job=job,reason=reason,remaining_seconds=deadline-self.now())
+            before=time.monotonic()
+            await self.sleep(duration)
+            self.event('wait_end',job=job,reason=reason,seconds=time.monotonic()-before)
     async def request(self,key,service,url,params=None,target=None,validate=None):
         if service in self.stopped: return None
+        expected_host='export.arxiv.org' if service=='arxiv' else 'api.semanticscholar.org'
+        if urlsplit(url).hostname!=expected_host or urlsplit(url).scheme!='https': raise ValueError('Disallowed service URL')
         net=self.config.network; state=self.state[service]
         gap=net['arxiv_gap_seconds'] if service=='arxiv' else net['s2_key_gap_seconds' if self.api_key else 's2_anonymous_gap_seconds']
+        queued=time.monotonic()
         async with self.locks[service]:
+            self.event('queue_acquired',job=key,seconds=time.monotonic()-queued)
             while self.store.get(key)['attempts']<3:
+                state['recent']=[t for t in state['recent'] if t>self.now()-net['s2_anonymous_window_seconds']]
                 deadline=state['deadline']
-                if service=='s2' and not self.api_key:
-                    recent=[t for t in state['recent'] if t>self.now()-net['s2_anonymous_window_seconds']]
-                    state['recent']=recent
-                    if len(recent)>=net['s2_anonymous_window_requests']: deadline=max(deadline,recent[0]+net['s2_anonymous_window_seconds'])
-                await self.wait(deadline)
+                if service=='s2' and not self.api_key and len(state['recent'])>=net['s2_anonymous_window_requests']:
+                    deadline=max(deadline,state['recent'][0]+net['s2_anonymous_window_seconds'])
+                await self.wait(deadline,key)
                 self.store.start_attempt(key)
-                state['recent'].append(self.now()); self.persist()
+                if service=='s2': state['recent'].append(self.now())
+                self.persist()
                 headers={'User-Agent':net['user_agent']}
                 if service=='s2' and self.api_key: headers['x-api-key']=self.api_key
-                code=0
+                code=0; error_code='unknown'; received=0; redirected=False
+                started=time.monotonic(); self.event('request_start',job=key,service=service,attempt=self.store.get(key)['attempts'])
                 try:
                     async with self.client.stream('GET',url,params=params,headers=headers,follow_redirects=False) as response:
                         code=response.status_code
-                        if code==200:
-                            if target:
-                                target.parent.mkdir(parents=True,exist_ok=True)
-                                with target.open('wb') as f:
-                                    async for chunk in response.aiter_bytes(): f.write(chunk)
-                                result=target
-                            else:
-                                result=await response.aread()
-                            if validate: result=await asyncio.to_thread(validate,result)
-                            state['backoff']=0
-                            return result
                         retry_after=parse_retry_after(response.headers.get('Retry-After'),datetime.fromtimestamp(self.now(),timezone.utc))
                         if code==429:
                             state['backoff']=state['backoff']*2 or 60
                             state['deadline']=max(state['deadline'],self.now()+(retry_after if retry_after is not None else state['backoff']))
-                        elif retry_after is not None:
-                            state['deadline']=max(state['deadline'],self.now()+retry_after)
-                        if code in (401,403): self.stopped.add(service)
-                        if code not in (408,429) and code<500:
-                            self.store.finish(key,'not_found' if code==404 else 'failed',f'http_{code}')
-                            return None
-                except (httpx.TransportError,ValueError):
-                    code=0
+                        else:
+                            state['backoff']=0
+                            if retry_after is not None: state['deadline']=max(state['deadline'],self.now()+retry_after)
+                        self.persist()
+                        if code in (301,302,303,307,308):
+                            location=response.headers.get('Location','')
+                            redirect=urljoin(str(response.url),location)
+                            parsed=urlsplit(redirect)
+                            if not location or parsed.scheme!='https' or parsed.hostname!=expected_host or parsed.username or parsed.password:
+                                self.store.finish(key,'failed','redirect_disallowed'); return None
+                            self.event('redirect',job=key,host=parsed.hostname)
+                            url=redirect; params=None; redirected=True
+                        elif code==200:
+                            if target:
+                                target.parent.mkdir(parents=True,exist_ok=True)
+                                metadata=dict(status_code=code,content_type=response.headers.get('content-type'),content_encoding=response.headers.get('content-encoding'),content_length=response.headers.get('content-length'),effective_url=str(response.url.copy_with(query=None)),bytes_received=0,complete=False)
+                                atomic_json(target.with_suffix('.response.json'),metadata)
+                                with target.open('wb') as f:
+                                    # Preserve the actual compressed entity; extraction owns gzip validation.
+                                    async for chunk in response.aiter_raw():
+                                        if shutil.disk_usage(target.parent).free<len(chunk)+self.config.execution['min_free_disk_bytes']: raise OSError('Insufficient disk space during download')
+                                        f.write(chunk); received+=len(chunk)
+                                metadata.update(bytes_received=received,complete=True,sha256=digest(target),download_seconds=time.monotonic()-started)
+                                atomic_json(target.with_suffix('.response.json'),metadata)
+                                result=target
+                            else: result=await response.aread(); received=len(result)
+                            self.event('download_end',job=key,bytes_received=received,seconds=time.monotonic()-started)
+                            if validate:
+                                extract_started=time.monotonic()
+                                task=asyncio.create_task(asyncio.to_thread(validate,result))
+                                try: result=await asyncio.shield(task)
+                                except asyncio.CancelledError:
+                                    await task
+                                    raise
+                                self.event('validation_end',job=key,seconds=time.monotonic()-extract_started)
+                            return result
+                        elif code not in (408,429) and code<500:
+                            if code in (401,403): self.stopped.add(service)
+                            self.store.finish(key,'not_found' if code==404 else 'failed',f'http_{code}'); return None
+                except httpx.TransportError as exc:
+                    code=0; error_code='transport_'+type(exc).__name__
+                except httpx.DecodingError:
+                    code=0; error_code='transport_DecodingError'
+                except ValueError as exc:
+                    code=0; error_code=PAYLOAD_CODES.get(str(exc),'payload_'+type(exc).__name__)
                 finally:
                     state['deadline']=max(state['deadline'],self.now()+gap); self.persist()
+                    self.event('request_end',job=key,service=service,status_code=code,error_code=error_code if code==0 else None,bytes_received=received,seconds=time.monotonic()-started)
+                    if self.metrics: self.metrics.sample(force_disk=True)
                 attempt=self.store.get(key)['attempts']
                 if attempt<3:
-                    state['deadline']=max(state['deadline'],self.now()+net['retry_delays_seconds'][attempt-1]); self.persist()
-                else: self.store.finish(key,'failed',f'http_{code}' if code else 'payload_or_transport')
+                    if not redirected:
+                        delay=net['retry_delays_seconds'][attempt-1]
+                        state['deadline']=max(state['deadline'],self.now()+delay); self.persist()
+                        self.event('retry',job=key,error_code=f'http_{code}' if code else error_code,backoff_seconds=delay)
+                else: self.store.finish(key,'failed',f'http_{code}' if code else error_code)
+            if self.store.get(key)['status'] in ('pending','running'): self.store.finish(key,'failed','attempts_exhausted')
             return None

@@ -1,5 +1,7 @@
 """Verified JSON publication and checksummed result manifests."""
 import hashlib
+from datetime import datetime, timezone
+import uuid
 import json
 import os
 import shutil
@@ -29,7 +31,9 @@ class Storage:
         base=self.paper_dir(paper)
         return base/'versions'/f'v{version}'/stage if version else base/stage
     def commit(self,key,staging,status='succeeded'):
-        target=self.result_dir(key); target.mkdir(parents=True,exist_ok=True)
+        target=self.result_dir(key)
+        if target.exists(): self.archive_result(key)
+        target.mkdir(parents=True,exist_ok=True)
         marker=target/'complete.json'
         if marker.exists(): marker.unlink()
         hashes={}
@@ -39,14 +43,27 @@ class Storage:
                 dest.parent.mkdir(parents=True,exist_ok=True); shutil.copyfile(source,dest)
                 hashes[rel.as_posix()]=digest(source)
                 if digest(dest)!=hashes[rel.as_posix()]: raise OSError('Checksum mismatch')
-        atomic_json(marker,dict(schema_version=1,key=list(key),status=status,checksums=hashes))
+        atomic_json(marker,dict(schema_version=1,key=list(key),status=status,checksums=hashes,captured_at=datetime.now(timezone.utc).isoformat(),run_id=getattr(self,'run_id',''),bytes=sum((target/name).stat().st_size for name in hashes)))
     def verify(self,key):
         target=self.result_dir(key)
         try:
             marker=json.loads((target/'complete.json').read_text())
             if marker['key']!=list(key): return None
+            if marker.get('status') not in ('succeeded','no_tex') or not marker.get('checksums'): return None
+            required='inventory.json' if key[2]=='source' else 'normalized.json'
+            if required not in marker['checksums']: return None
             for name,checksum in marker['checksums'].items():
                 p=Path(name)
                 if p.is_absolute() or '..' in p.parts or digest(target/p)!=checksum: return None
             return marker
         except (OSError,ValueError,KeyError): return None
+
+    def archive_result(self,key):
+        target=self.result_dir(key)
+        if not target.exists(): return
+        destination=self.paper_dir(key[0])/'history'/f'{key[2]}-{uuid.uuid4().hex}'
+        destination.parent.mkdir(parents=True,exist_ok=True)
+        shutil.copytree(target,destination)
+        for file in target.rglob('*'):
+            if file.is_file() and digest(file)!=digest(destination/file.relative_to(target)): raise OSError('History copy failed')
+        shutil.rmtree(target)

@@ -20,3 +20,48 @@ def test_last_429_persists(tmp_path):
             other=Scheduler(CrawlerConfig(),store,client,now=lambda:clock[0],sleep=sleep)
             assert other.state==s.state
     asyncio.run(check())
+
+def test_redirect_is_paced_and_key_does_not_leak(tmp_path):
+    async def check():
+        store=ProgressStore(tmp_path); store.initialize(['2504.02523'])
+        key=('2504.02523',0,'discovery',0); clock=[1000.0]; calls=[]
+        async def sleep(n): clock[0]+=n
+        def handle(request):
+            calls.append((clock[0],request.headers.get('x-api-key')))
+            return httpx.Response(302,headers={'Location':'/api/next'}) if len(calls)==1 else httpx.Response(200,content=b'ok')
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            scheduler=Scheduler(CrawlerConfig(),store,client,now=lambda:clock[0],sleep=sleep,api_key='secret')
+            assert await scheduler.request(key,'arxiv','https://export.arxiv.org/api/query')==b'ok'
+            assert calls[1][0]-calls[0][0]>=3
+            assert all(key is None for _,key in calls)
+    asyncio.run(check())
+
+def test_retry_after_date_and_long_wait():
+    from datetime import datetime,timezone
+    from crawler.retry import parse_retry_after
+    now=datetime(2026,1,1,tzinfo=timezone.utc)
+    assert parse_retry_after('Fri, 02 Jan 2026 00:00:00 GMT',now)==86400
+    assert parse_retry_after('90000',now)==90000
+
+def test_auth_stops_service_and_anonymous_window(tmp_path):
+    async def check():
+        store=ProgressStore(tmp_path); store.initialize(['2504.02523','2504.02524'])
+        c=CrawlerConfig(); c.network['s2_anonymous_window_requests']=1
+        clock=[1000.]; calls=[]
+        async def sleep(n): clock[0]+=n
+        def handler(request):
+            calls.append(clock[0]); return httpx.Response(200,content=b'ok')
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            scheduler=Scheduler(c,store,client,now=lambda:clock[0],sleep=sleep)
+            for paper in ('2504.02523','2504.02524'):
+                await scheduler.request((paper,0,'references',0),'s2','https://api.semanticscholar.org/graph/v1/paper/test/references')
+            assert calls[1]-calls[0]>=300
+        other=ProgressStore(tmp_path/'auth'); other.initialize(['2504.02523','2504.02524'])
+        calls.clear()
+        def denied(request): calls.append(1); return httpx.Response(401)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(denied)) as client:
+            scheduler=Scheduler(c,other,client,now=lambda:clock[0],sleep=sleep)
+            for paper in ('2504.02523','2504.02524'):
+                await scheduler.request((paper,0,'references',0),'s2','https://api.semanticscholar.org/graph/v1/paper/test/references')
+            assert len(calls)==1 and 's2' in scheduler.stopped
+    asyncio.run(check())

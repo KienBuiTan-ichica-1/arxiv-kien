@@ -1,45 +1,79 @@
-# Milestone 1 arXiv crawler — implementation in progress
+# Milestone 1 arXiv crawler
 
-**Chưa đạt toàn bộ đặc tả nghiệm thu. Không dùng bản này để crawl 5.000 ID.**
-Code hiện có pipeline thử nghiệm hai dịch vụ, retry tối đa ba lần/request,
-cooldown bền vững, lưu CSV/checksum, source extraction, S2 pagination,
-Parquet export và notebook thử tối đa 10 ID. Không có parsing bibliography,
-matching, Jupyter Book hay GitHub Pages.
+Python >=3.11, Colab CPU; inclusive range `2504.02523`–`2504.07522`.
+Metadata và source arXiv dùng chung scheduler nối tiếp; S2 có limiter riêng.
+Mỗi request tối đa ba attempts, gồm cả 429; source validation dùng cùng budget.
+Cooldown và attempts được lưu trước khi tiếp tục. Không tự retry failed khi resume.
 
-## Chạy offline
+## Kết quả smoke do người dùng cung cấp
 
-Python >=3.11. Dependency ranges chưa được khóa theo Colab vì chưa chạy Colab.
+Bản đầu đã chạy 10 ID trên Colab: discovery 10, version metadata 14,
+reference snapshots 10, source thành công 7 và thất bại 7.
+Hai source thất bại do HTTP 429. Năm archive còn lại được người dùng kiểm tra:
+`gzip.open()` đọc đến cuối đều báo EOFError (thiếu end-of-stream marker).
+Đã xác nhận archive bị cắt; chưa xác định tầng gây cắt (server/network/Colab).
+API key Semantic Scholar không thay đổi rate limit arXiv.
+
+Bản cập nhật phân biệt `payload_gzip_truncated`, `payload_invalid_gzip`,
+`payload_invalid_tar`, `transport_ReadTimeout` và các mã lỗi khác; lưu response
+metadata cùng số bytes, checksum, content type/encoding/length. Không đánh dấu
+archive hỏng là complete/no_tex. Chưa chạy live smoke cho bản cập nhật.
+
+## Cài và kiểm thử offline
 
 ```bash
 python -m pip install -r src/requirements.txt
 PYTHONPATH=src python -m pytest -q
 ```
 
-Các test dùng httpx MockTransport. Chưa gọi API thật, chưa chạy Colab, chưa
-crawl toàn range. Có test interruption/resume, last-attempt 429, malformed
-HTML/gzip, backup recovery và export thiếu metadata. Đây chưa phải toàn bộ
-ma trận test trong đặc tả.
+Dependency ranges chưa khóa theo Colab vì chưa thu thập package snapshot từ
+smoke bản cập nhật. Mỗi run tự lưu phiên bản package trong environment.json.
 
-## Thử trên Colab CPU
+## Dữ liệu và tương thích với bản đầu
 
-1. Đưa code đã review lên GitHub. Agent chưa commit/push; notebook clone remote
-   nên sẽ không thấy những file chỉ đang nằm ở workspace local.
-2. Mở `notebooks/crawl_colab.ipynb` trong Colab, chọn CPU.
-3. Mount Google Drive bằng giao diện Colab; tạo/chọn thư mục dự án trên Drive.
-4. Chạy cell chọn root, nhập thư mục thực tế. Đường dẫn này chỉ dùng trong
-   kernel, không ghi vào config hoặc dữ liệu. Xác nhận root thực sự trên Drive.
-5. Chạy cell clone/pull repo vào `code/`, cài dependency, import module.
-6. Chạy cell authentication. Config bật `allow_anonymous_s2: true`; tốc độ
-   anonymous là lựa chọn bảo thủ của dự án, không phải quota bảo đảm.
-7. Chạy cell smoke với `limit=10`. Kết quả lưu trong `runtime/` dưới Drive root.
-8. Stop giữa phiên rồi chạy lại cell. Nếu runtime chết để lại active marker,
-   chỉ dùng `takeover_stale=True` sau khi chắc chắn phiên cũ đã ngừng.
-9. Khi nhận key, tạo Colab Secret `SEMANTIC_SCHOLAR_API_KEY`, bật notebook access.
-   Chạy lại cell authentication rồi resume. Không đưa key vào code/YAML/output.
-   Local CLI đọc cùng tên biến môi trường. Không tự chuyển anonymous khi 401/403.
-10. Muốn thử lại failed stages: `store.reset('failed')`, sau đó chạy lại smoke.
+- `runtime/progress/jobs.csv`: ledger bền vững cho attempts từng request/page,
+  giữ tương thích dữ liệu smoke cũ. Không xóa hoặc sửa tay file này.
+- `papers.csv`, `versions.csv`: snapshots theo schema đặc tả, tạo tự động từ
+  ledger khi checkpoint. `status_counts()` đếm references theo bài, không cộng
+  page rows. Đây là lựa chọn tương thích: ledger giữ lịch sử retry chi tiết,
+  hai snapshots là view tái tạo được, không phải ba nguồn trạng thái độc lập.
+- `services.json`: cooldown và rolling-window S2 tồn tại qua restart.
+- Kết quả chỉ hợp lệ khi marker/checksum khớp. Legacy marker vẫn được đọc;
+  marker mới thêm UTC captured_at, run_id và số byte.
+- `reference-staging/`: raw pages có checksum/fingerprint để resume giữa trang.
+- `history/`: kết quả cũ được giữ khi chủ động refresh.
+- `metrics/<run_id>/`: environment, samples RAM/disk, paper elapsed và summary.
+- `logs/<run_id>/events.jsonl`: request, retry, wait heartbeat, commit, recovery.
+- `exports/<export_id>/`: Parquet, paper/version metrics CSV, run metrics,
+  reference conflict audit và manifest checksums/fingerprints.
 
-Không chạy hai notebook/CLI cùng dataset. Lock local không phải distributed lock.
+Mọi project path là tương đối với root đang làm việc. CSV UTF-8 dùng quoting;
+ô trống biểu thị thiếu dữ liệu. Dates thiếu giữ null, không suy ngày từ year.
+RAM trung bình có trọng số thời gian; peak RAM/disk là peak quan sát được,
+sampling có thể bỏ lỡ spike. Các metrics cũ chưa đo không được dựng lại giả.
+
+## Cập nhật Colab đang có dữ liệu
+
+1. Push bản code cập nhật lên GitHub, rồi mở `notebooks/crawl_colab.ipynb`.
+2. Chọn CPU, mount Drive bằng giao diện Files → Mount Drive.
+3. Chọn đúng project root đã dùng ở smoke cũ. Không tạo runtime mới.
+4. Chạy cell clone/pull và cài dependency. Nếu đã import crawler trước khi pull,
+   restart runtime, mount Drive lại rồi chạy lại các cell để dùng code mới.
+5. Giữ secret `SEMANTIC_SCHOLAR_API_KEY` trong Colab Secrets, bật Notebook access.
+   Cell authentication chỉ in `key` hoặc `anonymous`. Không dán key vào code.
+6. Chạy status/diagnostics. `diagnose_sources(config)` chỉ đọc file tạm, không gọi API.
+7. Bật `RETRY_FAILED_SOURCES = True` trong cell retry để mở chu kỳ mới cho các
+   source failed thuộc 10 ID đầu. Cell chạy nhánh arXiv với `limit=10`, giữ total
+   attempts và cooldown, bỏ qua metadata/source đã complete hợp lệ.
+8. Sau lần thử, đặt lại toggle False. Kiểm tra status và các mã lỗi mới.
+9. Stop giữa phiên rồi resume `limit=10`; kiểm tra file/checksum và tổng attempts.
+   Chỉ dùng `takeover_stale=True` khi chắc chắn runtime cũ đã ngừng.
+10. Sau smoke/interrupt check đạt, có thể chủ động chạy full range qua CLI hoặc
+    `await run_pipeline(config, {'arxiv','s2'}, resume=True, limit=None)`.
+
+Bật anonymous khi chưa có key: `execution.allow_anonymous_s2: true` (config mẫu).
+Env `SEMANTIC_SCHOLAR_API_KEY` ưu tiên hơn Secrets. 401/403 dừng dịch vụ tương ứng,
+không tự hạ xuống anonymous. Anonymous pacing là chính sách bảo thủ của dự án.
 
 ## CLI từ project root
 
@@ -47,39 +81,30 @@ Không chạy hai notebook/CLI cùng dataset. Lock local không phải distribut
 PYTHONPATH=src python -m crawler.cli init
 PYTHONPATH=src python -m crawler.cli run --limit 10
 PYTHONPATH=src python -m crawler.cli status
-PYTHONPATH=src python -m crawler.cli resume --limit 10
-PYTHONPATH=src python -m crawler.cli retry-failed
+PYTHONPATH=src python -m crawler.cli diagnose
+PYTHONPATH=src python -m crawler.cli retry-failed --limit 10 --stages arxiv
+PYTHONPATH=src python -m crawler.cli resume --limit 10 --stages arxiv
 PYTHONPATH=src python -m crawler.cli export --run-id export-001
 ```
 
-`retry-failed` chỉ reset trạng thái, không tự gọi mạng. Export không gọi API;
-chỉ dùng marker/checksum hợp lệ, không xuất reference snapshot dở. Thư mục
-export không được ghi đè. Raw reference thiếu arXiv ID vẫn được giữ trong JSON.
+CLI `retry-failed` chỉ reset failed stages của service được chọn, không gọi mạng.
+Notebook có lựa chọn source-only. `recheck-not-found` riêng cho not_found.
+`refresh-discovery --limit 10` và `refresh-references --limit 10` mở snapshot mới,
+giữ history; không tự refresh khi resume. `run`/`resume` không có `--limit` chọn
+cả 5.000 ID. Notebook smoke luôn truyền 10; không auto chạy full range.
 
-## Các khoảng thiếu phải hoàn thiện trước nghiệm thu
+Các lệnh mutation/export dùng chung local lock và active marker. Local lock
+không phải distributed lock trên Drive: chỉ một notebook/process ghi dataset.
+Redirect chỉ được theo trên cùng HTTPS service host và vẫn đi qua pacing/budget;
+redirect sang host khác ghi `redirect_disallowed`, không âm thầm dùng main site.
 
-- Progress hiện dùng `jobs.csv` với một row/request thay vì chính xác hai schema
-  `papers.csv`/`versions.csv` trong đặc tả. Chưa có migration/schema typed models.
-- Chưa có toàn bộ metrics: RAM/disk sampling, events/heartbeat, elapsed từng
-  paper, counters theo stage và hai CSV metrics cho export.
-- Chưa có `refresh-discovery`, refresh references và lịch sử snapshot đầy đủ.
-- Chưa có queue bounded riêng theo đúng hợp đồng; arXiv chọn luân phiên từ CSV
-  in-memory và S2 xử lý tuần tự độc lập.
-- Redirect hiện bị từ chối thành failed, chưa hỗ trợ redirect có scheduler.
-- CLI mặc định chỉ chọn 10 ID; chưa hoàn thiện chế độ full-range/resume theo spec.
-- Marker chưa đủ captured_at/run_id/provenance; validation/schema/guardrails và
-  xử lý concurrency giữa các lệnh CLI quản trị cần bổ sung.
-- Test chưa bao phủ mọi crash boundary, source traversal/limits, auth failure,
-  fingerprint changes, pagination exhaustion và cancellation race.
-
-Giữ code repo riêng với Drive runtime; report repo là milestone tương lai.
-
-## Nguồn API đã tham khảo
+## API và phạm vi
 
 - https://info.arxiv.org/help/api/user-manual.html
+- https://info.arxiv.org/help/api/tou.html
 - https://info.arxiv.org/help/mimetypes.html
 - https://api.semanticscholar.org/api-docs/graphs
-- https://api.semanticscholar.org/api-docs/snippets
+- https://www.python-httpx.org/quickstart/
 
-Việc đọc tài liệu không thay thế live smoke-test. Không khẳng định endpoint đã
-được kiểm chứng bằng request thật.
+Code repo và Drive runtime độc lập; parsing, matching, Jupyter Book, GitHub Pages,
+upload dataset và report repo thuộc milestone sau. Chưa chạy toàn bộ 5.000 ID.

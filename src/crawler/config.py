@@ -15,6 +15,12 @@ class CrawlerConfig:
         for value in self.paths.values():
             p=Path(value)
             if p.is_absolute() or '..' in p.parts: raise ValueError('Project paths must be relative and contained')
+        if self.schema_version!=1: raise ValueError('Unsupported config schema')
+        for name in ('queue_capacity','max_member_bytes','max_unpacked_bytes','ram_sample_seconds','disk_sample_seconds'):
+            if self.execution[name]<=0: raise ValueError(f'{name} must be positive')
+        for name in ('connect_timeout_seconds','read_timeout_seconds','s2_key_gap_seconds','s2_anonymous_gap_seconds','s2_anonymous_window_seconds','s2_anonymous_window_requests'):
+            if self.network[name]<=0: raise ValueError(f'{name} must be positive')
+        if len(self.network['retry_delays_seconds'])!=2 or any(v<0 for v in self.network['retry_delays_seconds']): raise ValueError('Expected two nonnegative retry delays')
         generate_ids(**self.range)
         if self.network['max_attempts'] != 3: raise ValueError('max_attempts must be 3')
         if self.network['arxiv_gap_seconds'] < 3: raise ValueError('arxiv gap must be >=3')

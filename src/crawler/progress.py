@@ -11,8 +11,8 @@ class ProgressStore:
     columns=['paper','version','stage','offset','status','attempts','total','cycle','error']
     def __init__(self,root):
         self.root=Path(root); self.path=self.root/'progress'/'jobs.csv'
-        self.lock=threading.RLock(); self.rows={}; self.storage=Storage(root)
-        if self.path.exists() or self.path.with_suffix('.bak').exists(): self.load()
+        self.lock=threading.RLock(); self.rows={}; self.storage=Storage(root); self.reference_counts={}
+        if self.path.exists() or self.path.with_suffix('.bak').exists() or self.path.with_suffix('.csv.json').exists() or (self.root/'progress/papers.csv').exists() or (self.root/'progress/versions.csv').exists() or (self.root/'progress/backups').exists() or (self.root/'data').exists(): self.load()
     def load(self):
         for path in (self.path,self.path.with_suffix('.bak')):
             try:
@@ -29,7 +29,14 @@ class ProgressStore:
                     if key in converted: raise ValueError('Duplicate job')
                     converted[key]=r
                 if len(converted)!=manifest['count']: raise ValueError('Invalid row count')
-                self.rows=converted; return
+                self.rows=converted
+                view=self.root/'progress/papers.csv'
+                if view.exists():
+                    try:
+                        with view.open(newline='',encoding='utf8') as f:
+                            self.reference_counts={r['arxiv_id']:int(r['reference_count']) for r in csv.DictReader(f) if r.get('reference_count','').isdigit()}
+                    except (OSError,ValueError,KeyError): pass
+                return
             except (OSError,ValueError,KeyError): continue
         raise RuntimeError('Progress and backup unavailable or corrupt; refusing empty dataset')
     def save(self):
@@ -48,6 +55,7 @@ class ProgressStore:
         checksum=digest(tmp); tmp.replace(self.path)
         atomic_json(self.path.with_suffix('.csv.json'),dict(sha256=checksum,count=len(self.rows)))
         if digest(self.path)!=checksum: raise OSError('CSV readback failed')
+        self.write_views()
     def add(self,key):
         if key not in self.rows:
             paper,version,stage,offset=key
@@ -64,26 +72,126 @@ class ProgressStore:
         with self.lock:
             row=self.rows[key]
             if row['attempts']>=3: raise RuntimeError('Attempt budget exhausted')
-            row['attempts']+=1; row['total']+=1; row['status']='running'; self.save()
+            row['attempts']+=1; row['total']+=1; row['status']='running'
+            if key[2]=='references': self.rows[(key[0],0,'references',0)]['status']='running'
+            self.save()
     def finish(self,key,status,error=''):
         with self.lock:
             self.rows[key].update(status=status,error=error); self.save()
-    def reconcile(self):
+    def reconcile(self,recover_running=True):
         with self.lock:
             for key,row in list(self.rows.items()):
+                if key[2]=='references' and key[3]!=0:
+                    # Page rows are retry history; only base row represents a paper snapshot.
+                    continue
                 marker=self.storage.verify(key)
                 if marker:
                     row['status']=marker['status']
+                    if key[2]=='references':
+                        self.reference_counts[key[0]]=len(json.loads((self.storage.result_dir(key)/'normalized.json').read_text())['references'])
                     if key[2]=='discovery':
                         meta=json.loads((self.storage.result_dir(key)/'normalized.json').read_text())
                         for v in range(1,meta['version']+1):
                             for stage in ('metadata','source'): self.add((key[0],v,stage,0))
-                elif row['status'] in ('running','succeeded','no_tex'):
-                    row['status']='pending' if row['attempts']<3 else 'failed'
+                elif row['status'] in ('running','succeeded','no_tex') and (recover_running or row['status']!='running'):
+                    attempts=row['attempts']
+                    if key[2]=='references':
+                        next_offset,finished=self.reference_resume_offset(key[0])
+                        attempts=0 if finished else self.rows.get((key[0],0,'references',next_offset),{}).get('attempts',0)
+                    row['status']='pending' if attempts<3 else 'failed'
                     row['error']='integrity_missing_result'
             self.save()
-    def reset(self,status='failed'):
+    def reset(self,status='failed',stages=None,ids=None):
         with self.lock:
-            for row in self.rows.values():
-                if row['status']==status: row.update(status='pending',attempts=0,cycle=row['cycle']+1,error='')
+            retry_papers={k[0] for k,r in self.rows.items() if k[2]=='references' and k[3]==0 and r['status']==status}
+            for key,row in self.rows.items():
+                if stages and key[2] not in stages: continue
+                if ids is not None and key[0] not in ids: continue
+                if row['status']==status or (key[2]=='references' and key[0] in retry_papers and (row['status']!='succeeded' or not self.valid_reference_page(key[0],key[3]))):
+                    row.update(status='pending',attempts=0,cycle=row['cycle']+1,error='')
             self.save()
+
+    def status_counts(self):
+        from collections import Counter
+        counts={stage:Counter() for stage in ('discovery','metadata','source','references')}
+        for key,row in self.rows.items():
+            if key[2]=='references' and key[3]!=0: continue
+            counts[key[2]][row['status']]+=1
+        return {stage:dict(values) for stage,values in counts.items()}
+
+    def write_views(self):
+        """Paper/version snapshots; request ledger retains per-page retry history."""
+        from datetime import datetime, timezone
+        now=datetime.now(timezone.utc).isoformat()
+        paper_columns='schema_version,arxiv_id,order_index,discovery_status,latest_version,discovery_attempts_total,discovery_cycle_attempts,discovery_cycle_id,discovery_error_code,discovery_error_message,references_status,references_attempts_total,references_cycle_id,references_current_offset,references_page_cycle_attempts,references_error_code,references_error_message,reference_count,updated_at,last_run_id'.split(',')
+        version_columns='schema_version,arxiv_id,version,order_index,metadata_status,metadata_attempts_total,metadata_cycle_attempts,metadata_cycle_id,metadata_error_code,metadata_error_message,source_status,source_attempts_total,source_cycle_attempts,source_cycle_id,source_error_code,source_error_message,updated_at,last_run_id'.split(',')
+        ids=list(dict.fromkeys(k[0] for k in self.rows if k[2]=='discovery'))
+        order={paper:i for i,paper in enumerate(ids)}
+        papers=[]; versions=[]
+        grouped={}
+        for key,value in self.rows.items(): grouped.setdefault(key[0],[]).append((key,value))
+        for paper in ids:
+            d=self.rows[(paper,0,'discovery',0)]; r=self.rows[(paper,0,'references',0)]
+            pages=[v for k,v in grouped[paper] if k[2]=='references']
+            current=max(pages,key=lambda v:v['offset'])
+            latest=max((k[1] for k,v in grouped[paper]),default=0)
+            item=dict(schema_version=1,arxiv_id=paper,order_index=order[paper],latest_version=latest or '',updated_at=now,last_run_id=getattr(self,'run_id',''))
+            for stage,row in [('discovery',d),('references',r)]:
+                item.update({f'{stage}_status':row['status'],f'{stage}_attempts_total':row['total'],f'{stage}_cycle_id':row['cycle'],f'{stage}_error_code':row['error'],f'{stage}_error_message':row['error']})
+            item.update(discovery_cycle_attempts=d['attempts'],references_attempts_total=sum(p['total'] for p in pages),references_current_offset=current['offset'],references_page_cycle_attempts=current['attempts'],reference_count='')
+            if r['status']=='succeeded': item['reference_count']=self.reference_counts.get(paper,'')
+            papers.append(item)
+        for paper,version in sorted({(k[0],k[1]) for k in self.rows if k[1]}):
+            item=dict(schema_version=1,arxiv_id=paper,version=version,order_index=order[paper],updated_at=now,last_run_id=getattr(self,'run_id',''))
+            for stage in ('metadata','source'):
+                row=self.rows.get((paper,version,stage,0),dict(status='pending',attempts=0,total=0,cycle=1,error=''))
+                for field,value in [('status',row['status']),('attempts_total',row['total']),('cycle_attempts',row['attempts']),('cycle_id',row['cycle']),('error_code',row['error']),('error_message',row['error'])]: item[f'{stage}_{field}']=value
+            versions.append(item)
+        for name,columns,rows in [('papers',paper_columns,papers),('versions',version_columns,versions)]:
+            target=self.root/'progress'/f'{name}.csv'; tmp=target.with_suffix('.tmp')
+            with tmp.open('w',newline='',encoding='utf8') as f:
+                writer=csv.DictWriter(f,fieldnames=columns); writer.writeheader(); writer.writerows(rows); f.flush(); os.fsync(f.fileno())
+            with tmp.open(newline='',encoding='utf8') as f:
+                if len(list(csv.DictReader(f)))!=len(rows): raise OSError('Snapshot row count mismatch')
+            if target.exists():
+                backup=self.root/'progress'/'backups'/target.name; backup.parent.mkdir(parents=True,exist_ok=True); shutil.copyfile(target,backup)
+            checksum=digest(tmp); tmp.replace(target)
+            if digest(target)!=checksum: raise OSError('Snapshot readback failed')
+
+    def refresh(self,stage,ids=None):
+        if stage not in ('discovery','references'): raise ValueError('Only discovery/references can be refreshed')
+        with self.lock:
+            for key,row in list(self.rows.items()):
+                if key[2]!=stage or key[3]!=0 or (ids is not None and key[0] not in ids): continue
+                self.storage.archive_result(key)
+                if stage=='references':
+                    staging=self.storage.paper_dir(key[0])/'reference-staging'
+                    if staging.exists():
+                        import uuid
+                        history=self.storage.paper_dir(key[0])/'history'/('reference-pages-'+uuid.uuid4().hex)
+                        history.parent.mkdir(parents=True,exist_ok=True); shutil.move(staging,history)
+                    for pkey,page in self.rows.items():
+                        if pkey[0]==key[0] and pkey[2]=='references': page.update(status='pending',attempts=0,cycle=page['cycle']+1,error='')
+                else: row.update(status='pending',attempts=0,cycle=row['cycle']+1,error='')
+            self.save()
+
+    def valid_reference_page(self,paper,offset):
+        from .semantic_scholar import parse_page
+        root=self.storage.paper_dir(paper)/'reference-staging'
+        directories=[p for p in root.iterdir() if p.is_dir()] if root.exists() else []
+        if len(directories)!=1: return None
+        directory=directories[0]
+        raw=directory/f'page-{offset:06d}.json'; marker=directory/f'page-{offset:06d}.complete.json'
+        try:
+            data=json.loads(marker.read_text())
+            if data.get('fingerprint')!=directory.name or data.get('sha256')!=digest(raw): return None
+            return parse_page(raw.read_bytes(),offset)
+        except (OSError,ValueError,TypeError): return None
+
+    def reference_resume_offset(self,paper):
+        offset=0
+        while True:
+            page=self.valid_reference_page(paper,offset)
+            if page is None: return offset,False
+            if page['next'] is None: return offset,True
+            offset=page['next']

@@ -1,0 +1,115 @@
+"""Measured per-session telemetry; monotonic durations and UTC audit timestamps."""
+import asyncio
+import csv
+import importlib.metadata
+import json
+import platform
+import shutil
+import time
+from dataclasses import asdict
+from datetime import datetime, timezone
+from pathlib import Path
+import psutil
+from .storage import atomic_json
+
+
+def utc_now(): return datetime.now(timezone.utc).isoformat()
+
+
+def weighted_mean(samples):
+    duration=sum(b[0]-a[0] for a,b in zip(samples,samples[1:]))
+    return sum(a[1]*(b[0]-a[0]) for a,b in zip(samples,samples[1:]))/duration if duration else None
+
+
+def unique_roots(paths):
+    result=[]
+    for path in sorted(set(map(Path,paths)),key=lambda p:(len(p.parts),str(p))):
+        if not any(path==root or root in path.parents for root in result): result.append(path)
+    return result
+
+
+class MetricsRecorder:
+    def __init__(self,config,auth_mode='anonymous'):
+        self.config=config; self.root=Path(config.paths['persistent_root']); self.auth_mode=auth_mode
+        self.samples=[]; self.paper_start={}; self.paper_end={}; self.disk_bytes=0; self.last_disk=-float('inf'); self.task=None; self.durations={}
+    def start(self,run_id):
+        self.run_id=run_id; self.started=time.monotonic(); self.started_at=utc_now()
+        self.directory=self.root/'metrics'/run_id; self.directory.mkdir(parents=True,exist_ok=True)
+        log=self.root/'logs'/run_id/'events.jsonl'; log.parent.mkdir(parents=True,exist_ok=True)
+        self.log=log.open('a',encoding='utf8')
+        self.resources=(self.directory/'resources.csv').open('w',newline='',encoding='utf8')
+        self.writer=csv.DictWriter(self.resources,fieldnames=['elapsed_seconds','utc','rss_bytes','disk_bytes']); self.writer.writeheader()
+        packages={}
+        for name in ('httpx','defusedxml','PyYAML','psutil','pyarrow'):
+            try: packages[name]=importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError: packages[name]=None
+        atomic_json(self.directory/'environment.json',dict(run_id=run_id,started_at=self.started_at,python=platform.python_version(),packages=packages,cpu_count=psutil.cpu_count(),ram_available_bytes=psutil.virtual_memory().available,disk_free_bytes=shutil.disk_usage(self.root).free,authentication=self.auth_mode,config=asdict(self.config)))
+        self.sample(force_disk=True)
+    def record(self,event,**fields):
+        # Callers pass only identifiers, durations, status codes; never headers/body/exception text.
+        for key in ('headers','api_key','authorization','body'): fields.pop(key,None)
+        row=dict(event=event,run_id=self.run_id,utc=utc_now(),elapsed_seconds=time.monotonic()-self.started,**fields)
+        self.log.write(json.dumps(row,ensure_ascii=False)+'\n'); self.log.flush()
+        if 'seconds' in fields: self.durations[event]=self.durations.get(event,0)+fields['seconds']
+        job=fields.get('job')
+        if job:
+            self.paper_start.setdefault(job[0],row['elapsed_seconds'])
+            self.paper_end[job[0]]=row['elapsed_seconds']
+    def sample(self,force_disk=False):
+        elapsed=time.monotonic()-self.started
+        process=psutil.Process(); rss=process.memory_info().rss
+        for child in process.children(recursive=True):
+            try: rss+=child.memory_info().rss
+            except (psutil.NoSuchProcess,psutil.AccessDenied): pass
+        if force_disk or elapsed-self.last_disk>=self.config.execution['disk_sample_seconds']:
+            total=0
+            for root in unique_roots(self.config.paths.values()):
+                for path in root.rglob('*'):
+                    try:
+                        if path.is_file() and not path.is_symlink(): total+=path.stat().st_size
+                    except FileNotFoundError: pass
+            self.disk_bytes=total; self.last_disk=elapsed
+        self.samples.append((elapsed,rss,self.disk_bytes))
+        atomic_json(self.directory/'checkpoint.json',dict(run_id=self.run_id,started_at=self.started_at,last_sample_at=utc_now(),wall_seconds=elapsed,incomplete=True,event_seconds=self.durations))
+        self.writer.writerow(dict(elapsed_seconds=elapsed,utc=utc_now(),rss_bytes=rss,disk_bytes=self.disk_bytes)); self.resources.flush()
+    async def monitor(self):
+        while True:
+            await asyncio.sleep(self.config.execution['ram_sample_seconds'])
+            self.sample()
+    def stop(self,store=None,incomplete=False):
+        self.sample(force_disk=True)
+        wall=time.monotonic()-self.started
+        paper_rows=[]
+        for paper,start in self.paper_start.items():
+            rows=[r for k,r in store.rows.items() if k[0]==paper and (k[2]!='references' or k[3]==0)] if store else []
+            complete=bool(rows) and all(r['status'] in ('succeeded','no_tex','not_found','failed') for r in rows)
+            paper_rows.append(dict(arxiv_id=paper,run_id=self.run_id,elapsed_seconds=self.paper_end[paper]-start,complete=complete))
+        with (self.directory/'paper_metrics.csv').open('w',newline='',encoding='utf8') as f:
+            writer=csv.DictWriter(f,fieldnames=['arxiv_id','run_id','elapsed_seconds','complete']); writer.writeheader(); writer.writerows(paper_rows)
+        summary=dict(run_id=self.run_id,started_at=self.started_at,finished_at=utc_now(),wall_seconds=wall,rss_peak_bytes=max(s[1] for s in self.samples),rss_time_weighted_mean_bytes=weighted_mean([(s[0],s[1]) for s in self.samples]),disk_observed_peak_bytes=max(s[2] for s in self.samples),ram_sample_seconds=self.config.execution['ram_sample_seconds'],disk_sample_seconds=self.config.execution['disk_sample_seconds'],sampling_note='Observed peaks can miss spikes between samples',authentication=self.auth_mode,status_counts=store.status_counts() if store else {})
+        previous=[]; interrupted=[]
+        for directory in (self.root/'metrics').iterdir():
+            if not directory.is_dir() or directory.name==self.run_id: continue
+            path=directory/'summary.json'
+            if not path.exists(): path=directory/'checkpoint.json'
+            if not path.exists(): continue
+            try:
+                record=json.loads(path.read_text()); previous.append(record)
+                if record.get('incomplete'): interrupted.append(record['run_id'])
+            except (OSError,ValueError): pass
+        summary['incomplete']=incomplete
+        summary['event_seconds']=self.durations
+        summary['active_wall_seconds']=wall+sum(r.get('wall_seconds',0) for r in previous)
+        summary['contributing_run_ids']=[r.get('run_id') for r in previous]+[self.run_id]
+        summary['interrupted_run_ids']=interrupted
+        starts=[r.get('started_at',self.started_at) for r in previous]+[self.started_at]
+        summary['calendar_elapsed_seconds']=(datetime.fromisoformat(summary['finished_at'])-min(datetime.fromisoformat(s) for s in starts)).total_seconds()
+        if store:
+            counts=store.status_counts()
+            def rate(n,d): return dict(numerator=n,denominator=d,value=n/d if d else None)
+            papers=sum(counts['discovery'].values()); versions=sum(counts['source'].values())
+            queried=sum(1 for k,r in store.rows.items() if k[2]=='references' and k[3]==0 and r['total']>0)
+            summary['rates']=dict(metadata_success=rate(counts['discovery'].get('succeeded',0),papers),source_coverage=rate(counts['source'].get('succeeded',0)+counts['source'].get('no_tex',0),versions),tex_availability=rate(counts['source'].get('succeeded',0),versions),s2_query_success=rate(counts['references'].get('succeeded',0),queried))
+        atomic_json(self.directory/'summary.json',summary)
+        self.resources.close(); self.log.close()
+        return summary

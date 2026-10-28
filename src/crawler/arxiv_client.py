@@ -1,10 +1,13 @@
 import re
 from defusedxml import ElementTree
+from defusedxml.common import DefusedXmlException
+from xml.etree.ElementTree import ParseError
 
 NS={'a':'http://www.w3.org/2005/Atom','x':'http://arxiv.org/schemas/atom'}
 
 def parse_atom(raw,paper,version=None):
-    root=ElementTree.fromstring(raw)
+    try: root=ElementTree.fromstring(raw)
+    except (ParseError,DefusedXmlException) as exc: raise ValueError('Invalid Atom XML') from exc
     if root.tag!='{http://www.w3.org/2005/Atom}feed': raise ValueError('Expected Atom feed')
     entries=root.findall('a:entry',NS)
     if not entries: return {'not_found':True}
