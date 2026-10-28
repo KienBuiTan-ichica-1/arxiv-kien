@@ -33,3 +33,19 @@ full-range CLI, refresh, notebook and comprehensive offline verification.
 
 - Final verification: `python -m pytest -q` → 78 passed; both notebook code cells
   compile with top-level await and have empty outputs; `git diff --check` clean.
+
+
+## Cross-month range and safe upgrade
+
+- Optional monthly_end_ids supplies verified last serials for every non-final
+  month. No automatic 99999 assumption or hidden API discovery. Same-month
+  default remains exactly 2504.02523–2504.07522; no progress schema changes.
+- Tests cover inclusive month/year rollover, invalid/missing bounds, YAML load,
+  and cross-year pipeline resume without repeat HTTP calls.
+- Safe-stop guide keeps the current VM alive, backs up full runtime to local
+  ZIP and downloads it before restart, then validates progress/cloud sync.
+- Review correction: absence of active_run.json alone is not proof of successful
+  finalization/checkpoint. Documentation now requires checking errors and progress.
+- Ruling: Require explicit monthly bounds rather than enumerate 99999 serials;
+  callers must obtain actual month boundaries from their assignment/verified
+  source. This avoids huge unintended crawls but requires extra cross-month config.

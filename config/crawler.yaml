@@ -4,6 +4,8 @@ range:
   start_id: 2523
   end_month: '2025-04'
   end_id: 7522
+  # Range xuyên tháng: thêm monthly_end_ids cho tháng đầu và các tháng giữa.
+  # Không dùng 99999 làm giới hạn giả định; xem README.
 paths:
   persistent_root: runtime
   scratch_root: runtime/temp

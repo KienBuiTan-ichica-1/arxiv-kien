@@ -193,9 +193,31 @@ range:
 
 Nó sinh `2504.02523` đến `2504.07522`, inclusive: 5.000 ID. Thay tháng bằng
 chuỗi `YYYY-MM` và thay số thứ tự bằng integer, không cần tự thêm số 0 đầu.
-Hiện chỉ hỗ trợ start_month bằng end_month. Đây là tháng của arXiv ID, không
-phải bộ lọc ngày/giờ published hoặc updated. Muốn nhiều tháng, chạy các range
-cùng-tháng riêng; chưa tự suy số ID cuối mỗi tháng.
+Hỗ trợ cùng tháng hoặc xuyên tháng/năm. Đây là tháng của arXiv ID, không phải
+bộ lọc ngày/giờ published hoặc updated. Với range xuyên tháng, phải cung cấp
+`monthly_end_ids` cho tháng đầu và từng tháng trung gian vì số thứ tự reset mỗi
+tháng. Không mặc định tháng nào cũng có 99.999 bài.
+
+Ví dụ minh họa cơ chế (giả sử tháng đầu đã được xác nhận kết thúc ở serial 10;
+đây không phải số bài thật của tháng 2025-04):
+
+```yaml
+range:
+  start_month: '2025-04'
+  start_id: 8
+  end_month: '2025-05'
+  end_id: 3
+  monthly_end_ids:
+    '2025-04': 10
+```
+
+Kết quả: `2504.00008`–`2504.00010`, rồi `2505.00001`–`2505.00003` (6 ID).
+Nếu có tháng trung gian, thêm mỗi tháng với serial cuối đã xác nhận. Tháng cuối
+không cần mapping: nó kết thúc tại end_id. Mapping chỉ khai báo giới hạn; code
+không tự tra API để chứng minh ID tồn tại. Dùng giới hạn theo đề/phân công hoặc
+nguồn đã xác nhận của nhóm, không chép số minh họa vào range thực tế.
+
+Range cùng tháng hiện tại không cần monthly_end_ids và giữ nguyên 5.000 ID.
 
 Sau khi sửa YAML, chạy lại cell `load_config` và cell scratch nếu dùng SSD.
 Notebook in ID đầu/cuối và tổng số để kiểm tra. Smoke vẫn giới hạn 10 ID đầu;
@@ -217,3 +239,5 @@ với YAML sửa riêng trong bản clone trên Drive.
 
 `notebooks/5000_crawl.ipynb` đã được thay bằng cell toàn range trong
 `notebooks/crawl_colab.ipynb`; chỉ cần duy trì một notebook.
+
+Hướng dẫn dừng, sao lưu và nâng cấp khi Drive chưa đồng bộ: [docs/safe-stop-and-upgrade.md](docs/safe-stop-and-upgrade.md).
