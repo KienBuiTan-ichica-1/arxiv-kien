@@ -1,6 +1,7 @@
 """Two independently paced service branches, sharing durable progress."""
 import asyncio
 from .locking import DatasetLock
+from .console import log
 from .metrics import MetricsRecorder, utc_now
 from urllib.parse import quote
 import hashlib
@@ -20,29 +21,37 @@ from .semantic_scholar import parse_page,FIELDS
 from .sources import inspect_and_extract
 
 async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_stale=False,transport=None,run_id=None,now=time.time,sleep=asyncio.sleep):
+    log('Startup: validating configuration and selecting IDs')
     config.validate(); stages=stages or {'arxiv','s2'}
     ids=generate_ids(**config.range)
     if limit is not None:
         if limit<1: raise ValueError('limit must be positive')
         selected=set(ids[:limit])
     else: selected=set(ids)
+    log('Startup: checking persistent directory')
     root=Path(config.paths['persistent_root']); root.mkdir(parents=True,exist_ok=True)
+    log('Startup: querying free disk space on Drive')
     if shutil.disk_usage(root).free<config.execution['min_free_disk_bytes']: raise OSError('Insufficient disk space')
+    log('Startup: disk space check complete')
     started=time.monotonic()
+    log('Startup: loading S2 credentials if selected')
     api_key=load_semantic_scholar_key() if 's2' in stages else None
     if 's2' in stages and not api_key and not config.execution['allow_anonymous_s2']:
         raise RuntimeError('Set API key or explicitly allow anonymous S2')
     print('[Startup] Loading progress snapshot and journal',flush=True)
     store=ProgressStore(root); store.run_id=run_id; store.storage.run_id=run_id
+    log('Startup: progress loaded; initializing/checkpointing jobs')
     store.initialize(ids)
     print('[Startup] Recovering interrupted jobs in selected scope',flush=True)
     recovery_stages=({'discovery','metadata','source'} if 'arxiv' in stages else set()) | ({'references'} if 's2' in stages else set())
     store.reconcile(ids=selected,stages=recovery_stages,recovery_only=True)
     print('[Startup] Recovery finished; initializing metrics',flush=True)
     metrics=MetricsRecorder(config,'key' if api_key else 'anonymous'); metrics.start(run_id)
+    log('Startup: metrics ready')
     metrics.record('recovery',counts=store.status_counts())
     monitor=asyncio.create_task(metrics.monitor())
     scratch=Path(config.paths['scratch_root'])/run_id
+    log('Startup: preparing scratch directory')
     scratch.mkdir(parents=True,exist_ok=True)
     async def metadata_batch(keys,scheduler):
         identifiers=[f'{key[0]}v{key[1]}' for key in keys]
@@ -187,6 +196,7 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
     try:
         timeout=httpx.Timeout(config.network['read_timeout_seconds'],connect=config.network['connect_timeout_seconds'])
         async with httpx.AsyncClient(timeout=timeout,transport=transport,follow_redirects=False) as client:
+            log('Run: loading service cooldowns and starting selected workers')
             scheduler=Scheduler(config,store,client,api_key=api_key,metrics=metrics,now=now,sleep=sleep)
             async with asyncio.TaskGroup() as group:
                 if 'arxiv' in stages: group.create_task(arxiv(scheduler))
@@ -197,13 +207,17 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
         try: await monitor
         except asyncio.CancelledError: 
             pass
+        log('Finalize: saving progress and CSV views')
         store.save(with_views=True)
+        log('Finalize: writing metrics summary')
         summary=metrics.stop(store,incomplete=not completed)
         summary['jobs']=len(store.rows)
+    log('Finalize: pipeline complete')
     return summary
 
 
 async def run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_stale=False,transport=None,now=time.time,sleep=asyncio.sleep):
+    log('Startup: pipeline entered; acquiring dataset lock')
     run_id=uuid.uuid4().hex
     with DatasetLock(config.paths['persistent_root'],run_id,takeover_stale):
         return await _run_pipeline(config,stages,resume,limit=limit,takeover_stale=takeover_stale,transport=transport,run_id=run_id,now=now,sleep=sleep)
