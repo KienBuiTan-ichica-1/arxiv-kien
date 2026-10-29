@@ -51,3 +51,25 @@ def test_unsafe_directory_rejected(tmp_path):
     with tarfile.open(p,'w:gz') as t:
         m=tarfile.TarInfo('../outside'); m.type=tarfile.DIRTYPE; t.addfile(m)
     with pytest.raises(ValueError): inspect_and_extract(p,tmp_path/'out',CrawlerConfig())
+
+
+def test_docx_and_unrecognized_zip(tmp_path):
+    import zipfile
+    archive=tmp_path/'source'
+    with zipfile.ZipFile(archive,'w') as z:
+        z.writestr('[Content_Types].xml','<Types><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+        z.writestr('word/document.xml','<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>')
+    result=inspect_and_extract(archive,tmp_path/'out',CrawlerConfig())
+    assert result['status']=='no_tex'
+    assert (tmp_path/'out/inventory.json').exists()
+    with zipfile.ZipFile(archive,'w') as z: z.writestr('error.html','<html>blocked</html>')
+    with pytest.raises(ValueError,match='Unrecognized'): inspect_and_extract(archive,tmp_path/'out',CrawlerConfig())
+
+
+def test_docx_resource_limit(tmp_path):
+    import zipfile
+    archive=tmp_path/'source'
+    with zipfile.ZipFile(archive,'w') as z: z.writestr('word/document.xml',b'x'*100)
+    config=CrawlerConfig(); config.execution['max_member_bytes']=20
+    with pytest.raises(RuntimeError,match='resource_limit'):
+        inspect_and_extract(archive,tmp_path/'out',config)

@@ -268,3 +268,31 @@ sau lần tiếp quản. Không xóa journal/cooldown để vượt lỗi.
 Khởi động đọc snapshot/journal nhưng không quét baseline dung lượng. Các thao
 tác đọc/ghi Drive khác vẫn có thể chậm. Các summary cũ có baseline toàn dataset
 không được so sánh trực tiếp với disk peak mới có phạm vi session_touched_paths.
+
+### Export M1 schema v2 và định dạng source
+
+`papers.parquet` chỉ chứa publication trong range có discovery succeeded và
+normalized metadata kiểm tra được checksum. ID pending/failed/not_found vẫn
+có trong `paper_metrics.csv`, cùng cột `metadata_exported`; không đếm số ID
+được giao như số publication thành công. Manifest có `assigned_ids`,
+`missing_metadata`, `schema_version=2` và phạm vi kiểm tra toàn vẹn. Export cũ
+không bị sửa; tạo run-id mới để xuất lại.
+
+Venue được bổ sung từ `citedPaper.venue` trong các snapshot references S2 đã
+lưu trong range, ghép bằng đúng ref_arxiv_id. `venue_source` ghi nguồn; giá trị
+mâu thuẫn giữ null và được liệt kê trong `venue_conflicts` của manifest. Không
+suy đoán venue từ DOI/journal_ref, không gọi thêm API. Vì vậy paper chưa được
+nhắc tới trong các snapshot có thể vẫn thiếu venue. Metadata arXiv raw được
+giữ nguyên; enrichment chỉ diễn ra lúc export, áp dụng cả dữ liệu cũ.
+
+Export kiểm tra checksum các JSON thực sự sử dụng và cache trong một lần
+chạy, không đọc lại mọi file TeX/Bib. Đây không phải full source audit; dùng
+cell audit riêng nếu cần kiểm tra toàn bộ source. `ref_submission_date` có
+nguồn S2 publicationDate, không khẳng định là ngày nộp arXiv. References là
+snapshot cấp paper, không phải bibliography từng version.
+
+DOCX độc lập được nhận diện qua cấu trúc OOXML, XML và CRC của ZIP, giữ các
+giới hạn kích thước; hợp lệ thì no_tex với inventory. HTML/ZIP không nhận diện
+được và payload hỏng vẫn là lỗi, không tự biến thành no_tex. Chỉ giữ .tex/.bib;
+không convert Word, .bbl hay parsing bibliography ở M1. Các archive chứa
+member nguy hiểm, tên trùng, link hoặc vượt giới hạn vẫn bị từ chối theo đặc tả.
