@@ -2,8 +2,38 @@ import gzip
 import zlib
 import shutil
 import tarfile
+import zipfile
+from defusedxml import ElementTree
+from defusedxml.common import DefusedXmlException
 from pathlib import Path, PurePosixPath
 from .storage import atomic_json, digest
+
+def is_docx(payload, limits):
+    """Recognize a bounded, CRC-valid OOXML Word package without extraction."""
+    if not zipfile.is_zipfile(payload): return False
+    try:
+        with zipfile.ZipFile(payload) as archive:
+            entries=archive.infolist()
+            names=[entry.filename for entry in entries]
+            if len(names)!=len(set(names)): raise ValueError('Duplicate ZIP member')
+            for entry in entries:
+                path=PurePosixPath(entry.filename)
+                if path.is_absolute() or '..' in path.parts or '\\' in entry.filename:
+                    raise ValueError('Unsafe archive member')
+                if entry.file_size>limits['max_member_bytes']: raise RuntimeError('resource_limit')
+            if sum(entry.file_size for entry in entries)>limits['max_unpacked_bytes']:
+                raise RuntimeError('resource_limit')
+            if not {'[Content_Types].xml','word/document.xml'}.issubset(names): return False
+            if any(entry.flag_bits & 1 for entry in entries): raise ValueError('Encrypted DOCX')
+            if archive.testzip() is not None: raise ValueError('Invalid DOCX CRC')
+            types=ElementTree.fromstring(archive.read('[Content_Types].xml'))
+            expected='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'
+            if not any(e.get('PartName')=='/word/document.xml' and e.get('ContentType')==expected for e in types): return False
+            document=ElementTree.fromstring(archive.read('word/document.xml'))
+            return sum(entry.file_size for entry in entries) if document.tag=='{http://schemas.openxmlformats.org/wordprocessingml/2006/main}document' else False
+    except (zipfile.BadZipFile, ElementTree.ParseError, DefusedXmlException) as exc:
+        raise ValueError('Invalid DOCX') from exc
+
 
 def inspect_and_extract(archive,staging,config):
     staging=Path(staging)
@@ -52,8 +82,10 @@ def inspect_and_extract(archive,staging,config):
             if total>min(limits['max_member_bytes'],limits['max_unpacked_bytes']): raise RuntimeError('resource_limit')
         elif any(token in prefix for token in (b'\\documentclass',b'\\documentstyle',b'\\begin{document}',b'\\input',b'\\def')) and b'<html' not in prefix.lower():
             with payload.open('rb') as f: save('source.tex',f,payload.stat().st_size)
+        elif docx_size:=is_docx(payload,limits):
+            total=docx_size; discarded=1
         else: raise ValueError('Unrecognized source payload')
     if payload!=Path(archive): payload.unlink()
-    result=dict(status='succeeded' if tex else 'no_tex',compressed_bytes=Path(archive).stat().st_size,unpacked_bytes=total,kept_bytes=kept,tex_count=tex,bib_count=bib,discarded_files=discarded,sha256=digest(archive))
+    result=dict(no_tex_reason=None if tex else 'valid_source_without_tex',status='succeeded' if tex else 'no_tex',compressed_bytes=Path(archive).stat().st_size,unpacked_bytes=total,kept_bytes=kept,tex_count=tex,bib_count=bib,discarded_files=discarded,sha256=digest(archive))
     atomic_json(staging/'inventory.json',result)
     return result
