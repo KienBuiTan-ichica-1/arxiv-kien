@@ -3,13 +3,13 @@ from pathlib import Path
 
 
 class DiskUsage:
-    def __init__(self,roots):
+    def __init__(self,roots,*,scan_existing=True):
         roots=sorted({Path(p).resolve() for p in roots},key=lambda p:(len(p.parts),str(p)))
         self.roots=[]
         for root in roots:
             if not any(root==r or r in root.parents for r in self.roots): self.roots.append(root)
         self.sizes={}; self.members={}; self.total=0
-        self.reconcile()
+        if scan_existing: self.reconcile()
 
     def reconcile(self):
         self.sizes={}; self.members={}; self.total=0
