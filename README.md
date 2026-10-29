@@ -241,3 +241,28 @@ với YAML sửa riêng trong bản clone trên Drive.
 `notebooks/crawl_colab.ipynb`; chỉ cần duy trì một notebook.
 
 Hướng dẫn dừng, sao lưu và nâng cấp khi Drive chưa đồng bộ: [docs/safe-stop-and-upgrade.md](docs/safe-stop-and-upgrade.md).
+
+### Resume và xác minh riêng
+
+Resume chỉ phục hồi job pending/running đã tiêu hao lượt thử trong phạm vi
+được chọn; không checksum lại toàn bộ kết quả thành công. Dữ liệu cũ giữ nguyên
+trạng thái và được audit riêng. Kết quả mới có `verification.json` sau khi
+publish và đối chiếu nội dung thành công. Receipt gắn với SHA-256 của manifest;
+receipt không bảo đảm phát hiện sửa đổi âm thầm của nội dung sau lần xác minh.
+
+Notebook có cell `RUN_AUDIT`: mặc định bỏ qua receipt hợp lệ, kiểm tra phần còn
+lại và lưu sau từng kết quả. `FULL_AUDIT=True` bắt đầu/tiếp tục một lượt kiểm tra
+lại toàn phạm vi, checkpoint tại `progress/audit.json`; sau khi hoàn tất, gọi
+full lần nữa tạo lượt mới. Giữ nguyên phạm vi khi tiếp tục lượt bị ngắt. Audit
+không gọi API, không reset trạng thái crawl, và dùng cùng DatasetLock nên phải
+chạy khi crawler dừng. Invalid cần được xem xét riêng (kể cả not_found không
+có payload/marker). File hỏng không được cấp dấu xác minh mới.
+
+`TAKEOVER_STALE` mặc định False. Chỉ bật sau lỗi dấu khóa cũ khi đã dừng/restart
+runtime cũ và chắc chắn không có runtime khác ghi dataset. Đóng tab hay mất
+kết nối không đủ xác nhận. Takeover không dừng tiến trình khác; đổi về False
+sau lần tiếp quản. Không xóa journal/cooldown để vượt lỗi.
+
+Khởi động vẫn đọc snapshot/journal và quét baseline dung lượng cho metrics;
+việc này có thể chậm trên Drive. Thay đổi này loại bỏ checksum toàn bộ lúc
+resume, không bảo đảm mọi thao tác Drive phản hồi nhanh hoặc ngắt tức thì.

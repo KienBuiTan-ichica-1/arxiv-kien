@@ -125,14 +125,19 @@ class ProgressStore:
             self.save(with_views=with_views)
             if with_views: self.dirty_count=0
 
-    def reconcile(self,recover_running=True):
+    def reconcile(self,recover_running=True,*,ids=None,stages=None,recovery_only=False):
         with self.lock:
             for key,row in list(self.rows.items()):
+                if ids is not None and key[0] not in ids: continue
+                if stages is not None and key[2] not in stages: continue
+                if recovery_only and row['status'] not in ('running','pending'): continue
+                if recovery_only and row['attempts']==0: continue
                 if key[2]=='references' and key[3]!=0:
                     # Page rows are retry history; only base row represents a paper snapshot.
                     continue
                 marker=self.storage.verify(key)
                 if marker:
+                    self.storage.record_verification(key)
                     row['status']=marker['status']
                     if key[2]=='references':
                         self.reference_counts[key[0]]=len(json.loads((self.storage.result_dir(key)/'normalized.json').read_text())['references'])
@@ -210,6 +215,10 @@ class ProgressStore:
         if stage not in ('discovery','references'): raise ValueError('Only discovery/references can be refreshed')
         with self.lock:
             for key,row in list(self.rows.items()):
+                if ids is not None and key[0] not in ids: continue
+                if stages is not None and key[2] not in stages: continue
+                if recovery_only and row['status'] not in ('running','pending'): continue
+                if recovery_only and row['attempts']==0: continue
                 if key[2]!=stage or key[3]!=0 or (ids is not None and key[0] not in ids): continue
                 self.storage.archive_result(key)
                 if stage=='references':
