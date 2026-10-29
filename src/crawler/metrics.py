@@ -12,6 +12,7 @@ from pathlib import Path
 import psutil
 from .storage import atomic_json
 from .disk_usage import DiskUsage
+from .console import log as console_log
 
 
 def utc_now(): return datetime.now(timezone.utc).isoformat()
@@ -34,6 +35,7 @@ class MetricsRecorder:
         self.config=config; self.root=Path(config.paths['persistent_root']); self.auth_mode=auth_mode
         self.samples=[]; self.paper_start={}; self.paper_end={}; self.disk_bytes=0; self.last_disk=-float('inf'); self.task=None; self.durations={}
     def start(self,run_id):
+        console_log('Metrics: creating log and resource files')
         self.run_id=run_id; self.started=time.monotonic(); self.started_at=utc_now()
         self.directory=self.root/'metrics'/run_id; self.directory.mkdir(parents=True,exist_ok=True)
         log=self.root/'logs'/run_id/'events.jsonl'; log.parent.mkdir(parents=True,exist_ok=True)
@@ -44,8 +46,11 @@ class MetricsRecorder:
         for name in ('httpx','defusedxml','PyYAML','psutil','pyarrow'):
             try: packages[name]=importlib.metadata.version(name)
             except importlib.metadata.PackageNotFoundError: packages[name]=None
+        console_log('Metrics: collecting environment and writing environment.json')
         atomic_json(self.directory/'environment.json',dict(run_id=run_id,started_at=self.started_at,python=platform.python_version(),packages=packages,cpu_count=psutil.cpu_count(),ram_available_bytes=psutil.virtual_memory().available,disk_free_bytes=shutil.disk_usage(self.root).free,authentication=self.auth_mode,config=asdict(self.config)))
+        console_log('Metrics: scanning directory tree for disk baseline (Drive may be slow)')
         self.disk=DiskUsage(self.config.paths.values())
+        console_log('Metrics: disk baseline complete; writing initial sample')
         self.sample(force_disk=True)
     def record(self,event,**fields):
         # Callers pass only identifiers, durations, status codes; never headers/body/exception text.
