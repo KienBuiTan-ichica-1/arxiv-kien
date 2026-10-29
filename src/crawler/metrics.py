@@ -47,10 +47,10 @@ class MetricsRecorder:
             try: packages[name]=importlib.metadata.version(name)
             except importlib.metadata.PackageNotFoundError: packages[name]=None
         console_log('Metrics: collecting environment and writing environment.json')
-        atomic_json(self.directory/'environment.json',dict(run_id=run_id,started_at=self.started_at,python=platform.python_version(),packages=packages,cpu_count=psutil.cpu_count(),ram_available_bytes=psutil.virtual_memory().available,disk_free_bytes=shutil.disk_usage(self.root).free,authentication=self.auth_mode,config=asdict(self.config)))
-        console_log('Metrics: scanning directory tree for disk baseline (Drive may be slow)')
-        self.disk=DiskUsage(self.config.paths.values())
-        console_log('Metrics: disk baseline complete; writing initial sample')
+        atomic_json(self.directory/'environment.json',dict(run_id=run_id,started_at=self.started_at,python=platform.python_version(),packages=packages,cpu_count=psutil.cpu_count(),ram_available_bytes=psutil.virtual_memory().available,disk_free_bytes=shutil.disk_usage(self.root).free,authentication=self.auth_mode,disk_measurement_scope='session_touched_paths',config=asdict(self.config)))
+        console_log('Metrics: initializing session path counters without dataset scan')
+        self.disk=DiskUsage(self.config.paths.values(),scan_existing=False)
+        console_log('Metrics: session counters ready; writing initial sample')
         self.sample(force_disk=True)
     def record(self,event,**fields):
         # Callers pass only identifiers, durations, status codes; never headers/body/exception text.
@@ -75,16 +75,18 @@ class MetricsRecorder:
             self.last_disk=elapsed
         self.disk_bytes=self.disk.total
         self.samples.append((elapsed,rss,self.disk_bytes))
-        atomic_json(self.directory/'checkpoint.json',dict(run_id=self.run_id,started_at=self.started_at,last_sample_at=utc_now(),wall_seconds=elapsed,incomplete=True,event_seconds=self.durations))
+        atomic_json(self.directory/'checkpoint.json',dict(run_id=self.run_id,started_at=self.started_at,last_sample_at=utc_now(),wall_seconds=elapsed,incomplete=True,event_seconds=self.durations,disk_measurement_scope='session_touched_paths'))
         self.writer.writerow(dict(elapsed_seconds=elapsed,utc=utc_now(),rss_bytes=rss,disk_bytes=self.disk_bytes)); self.resources.flush()
     def touch(self,*paths):
         for path in paths: self.disk.touch(path)
         self.disk_bytes=self.disk.total
 
     def reconcile_disk(self):
-        """Explicit, infrequent audit; not called for each sample/request."""
-        self.disk.reconcile()
-        self.disk_bytes=self.disk.total
+        """Explicit full measurement, returned separately from session counters."""
+        console_log('Metrics: explicit full disk scan started')
+        total=DiskUsage(self.config.paths.values()).total
+        console_log('Metrics: explicit full disk scan finished')
+        return total
 
     async def monitor(self):
         while True:
@@ -100,7 +102,7 @@ class MetricsRecorder:
             paper_rows.append(dict(arxiv_id=paper,run_id=self.run_id,elapsed_seconds=self.paper_end[paper]-start,complete=complete))
         with (self.directory/'paper_metrics.csv').open('w',newline='',encoding='utf8') as f:
             writer=csv.DictWriter(f,fieldnames=['arxiv_id','run_id','elapsed_seconds','complete']); writer.writeheader(); writer.writerows(paper_rows)
-        summary=dict(run_id=self.run_id,started_at=self.started_at,finished_at=utc_now(),wall_seconds=wall,rss_peak_bytes=max(s[1] for s in self.samples),rss_time_weighted_mean_bytes=weighted_mean([(s[0],s[1]) for s in self.samples]),disk_observed_peak_bytes=max(s[2] for s in self.samples),ram_sample_seconds=self.config.execution['ram_sample_seconds'],disk_sample_seconds=self.config.execution['disk_sample_seconds'],sampling_note='Incremental logical file-byte counters; observed peaks can miss spikes between samples; not filesystem allocation',authentication=self.auth_mode,status_counts=store.status_counts() if store else {})
+        summary=dict(run_id=self.run_id,started_at=self.started_at,finished_at=utc_now(),wall_seconds=wall,rss_peak_bytes=max(s[1] for s in self.samples),rss_time_weighted_mean_bytes=weighted_mean([(s[0],s[1]) for s in self.samples]),disk_observed_peak_bytes=max(s[2] for s in self.samples),ram_sample_seconds=self.config.execution['ram_sample_seconds'],disk_sample_seconds=self.config.execution['disk_sample_seconds'],disk_measurement_scope='session_touched_paths',sampling_note='Logical bytes of paths observed in this session, including existing files in touched subtrees; not total dataset size or downloaded bytes; observed peaks can miss spikes; not filesystem allocation',authentication=self.auth_mode,status_counts=store.status_counts() if store else {})
         previous=[]; interrupted=[]
         for directory in (self.root/'metrics').iterdir():
             if not directory.is_dir() or directory.name==self.run_id: continue

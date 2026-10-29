@@ -158,9 +158,11 @@ Sau cập nhật code cần restart kernel trước khi import lại crawler. Ch
 - Migrate tự động: snapshot jobs.csv cũ vẫn đọc được; journal mới được tạo khi
   có mutation. Khi sao lưu/chuyển dataset, phải mang cả thư mục progress. Không
   chạy bản crawler cũ trên dataset đã có journal vì bản cũ không đọc delta.
-- Disk metrics quét baseline một lần, sau đó cập nhật file/subtree vừa thay đổi
+- Disk metrics khởi tạo không quét dataset, chỉ cập nhật file/subtree được quan sát
   (paper, progress và staging), không rglob toàn Drive ở mỗi request/sample.
-  Có `metrics.reconcile_disk()` để đối soát đầy đủ một cách chủ động/thưa.
+  `disk_measurement_scope=session_touched_paths`: có thể gồm file cũ trong subtree
+  được chạm tới; không phải tổng dataset hay số byte vừa tải.
+  `metrics.reconcile_disk()` trả riêng tổng đo toàn bộ, không đổi bộ đếm phiên.
   Staging thành công được xóa sau publish, staging thất bại giữ để chẩn đoán.
 - RAM/disk metrics vẫn là mẫu quan sát, không bảo đảm bắt được spike giữa hai
   mẫu. Các file nguồn cuối vẫn giữ cấu trúc TeX/Bib trên Drive; chưa đổi sang
@@ -263,6 +265,6 @@ runtime cũ và chắc chắn không có runtime khác ghi dataset. Đóng tab h
 kết nối không đủ xác nhận. Takeover không dừng tiến trình khác; đổi về False
 sau lần tiếp quản. Không xóa journal/cooldown để vượt lỗi.
 
-Khởi động vẫn đọc snapshot/journal và quét baseline dung lượng cho metrics;
-việc này có thể chậm trên Drive. Thay đổi này loại bỏ checksum toàn bộ lúc
-resume, không bảo đảm mọi thao tác Drive phản hồi nhanh hoặc ngắt tức thì.
+Khởi động đọc snapshot/journal nhưng không quét baseline dung lượng. Các thao
+tác đọc/ghi Drive khác vẫn có thể chậm. Các summary cũ có baseline toàn dataset
+không được so sánh trực tiếp với disk peak mới có phạm vi session_touched_paths.

@@ -279,8 +279,10 @@ thường với một số job failed. Cờ complete của paper metrics cũng l
 coverage, trong đó failed là một trạng thái terminal.
 
 Peak RAM/disk là đỉnh quan sát được; sampling có thể bỏ lỡ spike. Disk counter
-hiện dùng một baseline scan rồi cập nhật vùng thay đổi, đo logical file bytes,
-không phải số block vật lý mà filesystem cấp phát.
+hiện không quét baseline lúc khởi động. `disk_measurement_scope=session_touched_paths`
+trong environment/checkpoint/summary chỉ logical bytes của đường dẫn được quan sát
+trong phiên (có thể gồm file cũ ở subtree được chạm tới), không phải tổng dataset,
+byte tải mới hoặc block filesystem. Summary cũ dùng baseline có phạm vi khác.
 
 Nhiều run folders là bình thường: mỗi lần gọi pipeline có một ID mới. Dữ liệu
 paper dùng chung trong `data/`, còn logs/metrics giữ riêng lịch sử từng phiên.

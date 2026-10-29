@@ -33,9 +33,10 @@ def test_journal_torn_tail_and_integrity(tmp_path):
 def test_disk_sampling_avoids_repeated_full_walk(tmp_path,monkeypatch):
     from crawler.metrics import MetricsRecorder
     monkeypatch.chdir(tmp_path); Path('runtime').mkdir()
-    metrics=MetricsRecorder(CrawlerConfig()); metrics.start('run')
+    metrics=MetricsRecorder(CrawlerConfig())
     def forbidden(*args,**kwargs): raise AssertionError('Repeated full disk walk')
     monkeypatch.setattr(Path,'rglob',forbidden)
+    metrics.start('run')
     metrics.sample(force_disk=True)
     metrics.stop()
 
@@ -181,3 +182,30 @@ def test_explicit_reload_replays_once(tmp_path):
     assert store.get(key)['attempts']==1
     store.load()
     assert store.get(key)['attempts']==1
+
+
+def test_session_disk_counter_excludes_untouched_old_files(tmp_path):
+    from crawler.disk_usage import DiskUsage
+    root=tmp_path/'runtime'; root.mkdir()
+    (root/'old').write_bytes(b'x'*1000)
+    fresh=root/'fresh'; fresh.write_bytes(b'123')
+    disk=DiskUsage([root],scan_existing=False)
+    assert disk.total==0
+    disk.touch(fresh); assert disk.total==3
+    fresh.write_bytes(b'12345'); disk.touch(fresh); assert disk.total==5
+    fresh.unlink(); disk.touch(fresh); assert disk.total==0
+
+
+def test_metrics_scope_and_explicit_scan_are_separate(tmp_path,monkeypatch):
+    from crawler.metrics import MetricsRecorder
+    monkeypatch.chdir(tmp_path); Path('runtime').mkdir()
+    old=Path('runtime/old'); old.write_bytes(b'x'*100000)
+    metrics=MetricsRecorder(CrawlerConfig()); metrics.start('scope')
+    before=metrics.disk.total
+    assert metrics.reconcile_disk()>=100000
+    assert metrics.disk.total==before
+    summary=metrics.stop()
+    assert summary['disk_measurement_scope']=='session_touched_paths'
+    assert summary['disk_observed_peak_bytes']<100000
+    env=json.loads((metrics.directory/'environment.json').read_text())
+    assert env['disk_measurement_scope']=='session_touched_paths'
