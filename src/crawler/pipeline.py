@@ -32,8 +32,13 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
     api_key=load_semantic_scholar_key() if 's2' in stages else None
     if 's2' in stages and not api_key and not config.execution['allow_anonymous_s2']:
         raise RuntimeError('Set API key or explicitly allow anonymous S2')
+    print('[Startup] Loading progress snapshot and journal',flush=True)
     store=ProgressStore(root); store.run_id=run_id; store.storage.run_id=run_id
-    store.initialize(ids); store.reconcile()
+    store.initialize(ids)
+    print('[Startup] Recovering interrupted jobs in selected scope',flush=True)
+    recovery_stages=({'discovery','metadata','source'} if 'arxiv' in stages else set()) | ({'references'} if 's2' in stages else set())
+    store.reconcile(ids=selected,stages=recovery_stages,recovery_only=True)
+    print('[Startup] Recovery finished; initializing metrics',flush=True)
     metrics=MetricsRecorder(config,'key' if api_key else 'anonymous'); metrics.start(run_id)
     metrics.record('recovery',counts=store.status_counts())
     monitor=asyncio.create_task(metrics.monitor())

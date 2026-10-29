@@ -38,12 +38,27 @@ class Storage:
         if marker.exists(): marker.unlink()
         hashes={}
         for source in Path(staging).rglob('*'):
-            if source.is_file() and source.name!='complete.json':
+            if source.is_file() and source.name not in ('complete.json','verification.json'):
                 rel=source.relative_to(staging); dest=target/rel
                 dest.parent.mkdir(parents=True,exist_ok=True); shutil.copyfile(source,dest)
                 hashes[rel.as_posix()]=digest(source)
                 if digest(dest)!=hashes[rel.as_posix()]: raise OSError('Checksum mismatch')
         atomic_json(marker,dict(schema_version=1,key=list(key),status=status,checksums=hashes,captured_at=datetime.now(timezone.utc).isoformat(),run_id=getattr(self,'run_id',''),bytes=sum((target/name).stat().st_size for name in hashes)))
+        self.record_verification(key)
+
+    def record_verification(self,key):
+        target=self.result_dir(key)
+        atomic_json(target/'verification.json',dict(schema_version=1,
+            manifest_digest=digest(target/'complete.json'),
+            verified_at=datetime.now(timezone.utc).isoformat()))
+
+    def is_verified(self,key):
+        target=self.result_dir(key)
+        try:
+            receipt=json.loads((target/'verification.json').read_text())
+            return receipt.get('schema_version')==1 and receipt['manifest_digest']==digest(target/'complete.json')
+        except (OSError,ValueError,KeyError): return False
+
     def verify(self,key):
         target=self.result_dir(key)
         try:
