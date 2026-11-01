@@ -52,6 +52,7 @@ def test_versions_have_separate_queries_snapshots_and_legacy_is_preserved(tmp_pa
 
 
 def test_batch_passes_shrink_after_no_response_then_fallback_to_pagination(tmp_path,monkeypatch):
+    from crawler.diagnostics import diagnose_references
     config,_=setup(tmp_path,monkeypatch); config.network['s2_batch_size']=100
     calls=[]; observed_caps=[]
     def handler(request):
@@ -78,6 +79,7 @@ def test_batch_passes_shrink_after_no_response_then_fallback_to_pagination(tmp_p
     assert first['batch_provenance']['pass']==1
     assert fifth['page_provenance'][0]['offset']==0
     assert len(list((Path('runtime/data/reference-batches')).rglob('*.complete.json')))==4
+    assert sum(run['snapshots_recorded'] for run in diagnose_references(config)['runs'])==2
 
 
 def test_resume_after_publish_before_progress_ack_does_not_fetch(tmp_path,monkeypatch):

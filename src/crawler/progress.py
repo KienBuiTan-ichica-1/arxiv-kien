@@ -308,7 +308,9 @@ class ProgressStore:
                         history=self.storage.paper_dir(key[0])/'history'/('reference-pages-'+uuid.uuid4().hex)
                         history.parent.mkdir(parents=True,exist_ok=True); shutil.move(staging,history)
                     for pkey,page in self.rows.items():
-                        if pkey[:2]==key[:2] and pkey[2]=='references': page.update(status='pending',attempts=0,cycle=page['cycle']+1,error='')
+                        if pkey[:2]==key[:2] and pkey[2]=='references':
+                            page.update(status='pending',attempts=0,cycle=page['cycle']+1,error='')
+                            if pkey[3]==0: page.update(reference_pass=1,batch_cap=100)
                 else: row.update(status='pending',attempts=0,cycle=row['cycle']+1,error='')
             self.save()
 

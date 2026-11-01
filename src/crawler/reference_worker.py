@@ -150,6 +150,12 @@ class ReferenceWorker:
         await self.telemetry.call(self.metrics.record,'commit',job=keys[0],jobs=keys,
                                   service='s2',seconds=time.monotonic()-started)
         await self.telemetry.call(self.metrics.touch,batch_path,batch_path.with_suffix('.complete.json'))
+        complete_paths=[]
+        for key,count,_ in acknowledgements:
+            if count is None: continue
+            await self.telemetry.call(self.metrics.record,'reference_snapshot',job=key,service='s2',references=count)
+            complete_paths.append(self.store.storage.result_dir(key))
+        if complete_paths: await self.telemetry.call(self.metrics.touch,*complete_paths)
         completed=sum(count is not None for _,count,_ in acknowledgements)
         log(f'S2: batch pass {pass_number} published, {completed} complete, {len(keys)-completed} deferred')
 
