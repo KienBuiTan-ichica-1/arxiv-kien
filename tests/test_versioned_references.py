@@ -13,6 +13,7 @@ PAPER='2504.02523'
 def setup(tmp_path,monkeypatch,versions=2):
     monkeypatch.chdir(tmp_path)
     config=CrawlerConfig(); config.range['end_id']=2523
+    config.network['s2_batch_size']=0
     config.execution['allow_anonymous_s2']=True
     store=ProgressStore('runtime'); store.initialize([PAPER])
     for v in range(1,versions+1):
@@ -48,6 +49,37 @@ def test_versions_have_separate_queries_snapshots_and_legacy_is_preserved(tmp_pa
     assert store.get((PAPER,0,'references',0))['total']==0
     assert result['status_counts']['references']=={'succeeded':2}
     assert result['status_counts']['legacy_references']=={'succeeded':1}
+
+
+def test_batch_passes_shrink_after_no_response_then_fallback_to_pagination(tmp_path,monkeypatch):
+    from crawler.diagnostics import diagnose_references
+    config,_=setup(tmp_path,monkeypatch); config.network['s2_batch_size']=100
+    calls=[]; observed_caps=[]
+    def handler(request):
+        calls.append(request.method)
+        if request.method=='POST':
+            observed_caps.append(ProgressStore('runtime').get((PAPER,1,'references',0))['batch_cap'])
+            if len(calls)<=3: raise httpx.ReadError('temporary',request=request)
+            ids=json.loads(request.content)['ids']
+            return httpx.Response(200,json=[
+                dict(paperId=f'S2-v{version}',referenceCount=0 if version==1 else 1,references=[])
+                for version in (1,2) if any(f'v{version}' in identifier for identifier in ids)
+            ])
+        return httpx.Response(200,json={'data':[]})
+
+    run(config,handler)
+
+    store=ProgressStore('runtime')
+    assert observed_caps[:4]==[100,100,100,75]
+    assert calls==['POST']*7+['GET']
+    assert store.get((PAPER,1,'references',0))['status']=='succeeded'
+    assert (store.get((PAPER,2,'references',0))['status'],store.get((PAPER,2,'references',0))['reference_pass'])==('succeeded',5)
+    first=json.loads((store.storage.result_dir((PAPER,1,'references',0))/'normalized.json').read_text())
+    fifth=json.loads((store.storage.result_dir((PAPER,2,'references',0))/'normalized.json').read_text())
+    assert first['batch_provenance']['pass']==1
+    assert fifth['page_provenance'][0]['offset']==0
+    assert len(list((Path('runtime/data/reference-batches')).rglob('*.complete.json')))==4
+    assert sum(run['snapshots_recorded'] for run in diagnose_references(config)['runs'])==2
 
 
 def test_resume_after_publish_before_progress_ack_does_not_fetch(tmp_path,monkeypatch):

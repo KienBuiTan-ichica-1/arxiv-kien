@@ -9,7 +9,8 @@ from .storage import Storage, atomic_json, digest
 from .journal import ProgressJournal
 
 class ProgressStore:
-    columns=['paper','version','stage','offset','status','attempts','total','cycle','error']
+    legacy_columns=['paper','version','stage','offset','status','attempts','total','cycle','error']
+    columns=legacy_columns+['reference_pass','batch_cap']
     def __init__(self,root):
         self.root=Path(root); self.path=self.root/'progress'/'jobs.csv'
         self.lock=threading.RLock(); self.rows={}; self.storage=Storage(root); self.reference_counts={}
@@ -25,7 +26,7 @@ class ProgressStore:
                 if digest(path)!=manifest['sha256']: raise ValueError('Invalid checksum')
                 with path.open(newline='',encoding='utf8') as f:
                     reader=csv.DictReader(f)
-                    if reader.fieldnames!=self.columns: raise ValueError('Invalid schema')
+                    if reader.fieldnames not in (self.legacy_columns,self.columns): raise ValueError('Invalid schema')
                     rows=list(reader)
                 converted={}
                 for r in rows:
@@ -35,6 +36,10 @@ class ProgressStore:
                     converted[key]=r
                 if len(converted)!=manifest['count']: raise ValueError('Invalid row count')
                 self.journal.replay(converted,manifest.get('journal_sequence',0))
+                for r in converted.values():
+                    base_reference=r['stage']=='references' and int(r['offset'])==0
+                    r['reference_pass']=int(r.get('reference_pass') or (1 if base_reference else 0))
+                    r['batch_cap']=int(r.get('batch_cap') or (100 if base_reference else 0))
                 self.rows=converted
                 self._saved_rows={k:dict(r) for k,r in self.rows.items()}
                 view=self.root/'progress/papers.csv'
@@ -93,7 +98,8 @@ class ProgressStore:
     def add(self,key):
         if key not in self.rows:
             paper,version,stage,offset=key
-            self.rows[key]=dict(paper=paper,version=version,stage=stage,offset=offset,status='pending',attempts=0,total=0,cycle=1,error='')
+            base_reference=stage=='references' and offset==0
+            self.rows[key]=dict(paper=paper,version=version,stage=stage,offset=offset,status='pending',attempts=0,total=0,cycle=1,error='',reference_pass=1 if base_reference else 0,batch_cap=100 if base_reference else 0)
     def initialize(self,ids,*,versioned=False):
         with self.lock:
             for paper in ids:
@@ -140,6 +146,54 @@ class ProgressStore:
             with_views=self.dirty_count>=50
             self.save(with_views=with_views)
             if with_views: self.dirty_count=0
+
+    def advance_reference_pass(self,keys,error):
+        with self.lock:
+            for key in keys:
+                row=self.rows[key]
+                if key[2:]!=('references',0) or row['reference_pass'] not in range(1,5):
+                    raise ValueError('Only batch reference jobs can advance pass')
+            for key in keys:
+                row=self.rows[key]
+                row.update(reference_pass=row['reference_pass']+1,batch_cap=100,
+                           status='pending',attempts=0,cycle=row['cycle']+1,error=error)
+            self.save()
+
+    def reduce_reference_batch(self,keys,error):
+        caps={100:75,75:50,50:25}
+        with self.lock:
+            for key in keys:
+                row=self.rows[key]
+                if key[2:]!=('references',0) or row['batch_cap'] not in (25,50,75,100):
+                    raise ValueError('Invalid batch reference job')
+            if all(self.rows[key]['batch_cap']==25 for key in keys):
+                self.advance_reference_pass(keys,error); return
+            if len({self.rows[key]['batch_cap'] for key in keys})!=1:
+                raise ValueError('Batch jobs must share one cap')
+            for key in keys:
+                row=self.rows[key]
+                row.update(batch_cap=caps[row['batch_cap']],status='pending',attempts=0,
+                           cycle=row['cycle']+1,error=error)
+            self.save()
+
+    def acknowledge_reference_batch(self,results):
+        """Atomically publish complete counts and defer incomplete jobs one pass."""
+        with self.lock:
+            for key,count,error in results:
+                row=self.rows[key]
+                if key[2:]!=('references',0) or row['reference_pass'] not in range(1,5):
+                    raise ValueError('Invalid batch acknowledgement')
+                if count is not None and (type(count) is not int or count<0):
+                    raise ValueError('Invalid reference count')
+            for key,count,error in results:
+                row=self.rows[key]
+                if count is not None:
+                    row.update(status='succeeded',error='')
+                    self.reference_counts[key[:2]]=count
+                else:
+                    row.update(reference_pass=row['reference_pass']+1,batch_cap=100,
+                               status='pending',attempts=0,cycle=row['cycle']+1,error=error)
+            self.save()
 
     def reconcile(self,recover_running=True,*,ids=None,stages=None,recovery_only=False,skip_legacy_references=False):
         with self.lock:
@@ -254,7 +308,9 @@ class ProgressStore:
                         history=self.storage.paper_dir(key[0])/'history'/('reference-pages-'+uuid.uuid4().hex)
                         history.parent.mkdir(parents=True,exist_ok=True); shutil.move(staging,history)
                     for pkey,page in self.rows.items():
-                        if pkey[:2]==key[:2] and pkey[2]=='references': page.update(status='pending',attempts=0,cycle=page['cycle']+1,error='')
+                        if pkey[:2]==key[:2] and pkey[2]=='references':
+                            page.update(status='pending',attempts=0,cycle=page['cycle']+1,error='')
+                            if pkey[3]==0: page.update(reference_pass=1,batch_cap=100)
                 else: row.update(status='pending',attempts=0,cycle=row['cycle']+1,error='')
             self.save()
 

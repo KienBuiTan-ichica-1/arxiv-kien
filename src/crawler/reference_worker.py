@@ -2,12 +2,13 @@
 import asyncio
 import hashlib
 import json
+import os
 import uuid
 import time
 from urllib.parse import quote
 from .console import log
 from .metrics import utc_now
-from .semantic_scholar import FIELDS, parse_page
+from .semantic_scholar import FIELDS, parse_batch, parse_page
 from .storage import atomic_json, digest
 from .workers import ThreadWorker
 
@@ -19,12 +20,15 @@ def query_identity(paper, version, page_size):
     fingerprint=hashlib.sha256(json.dumps(query,sort_keys=True).encode()).hexdigest()
     return query,fingerprint
 
+BATCH_FIELDS='paperId,referenceCount,'+','.join(f'references.{field}' for field in FIELDS.split(','))
+
 
 class ReferenceWorker:
     def __init__(self,config,store,progress,io,reader,telemetry,metrics,scratch,selected):
         self.config=config; self.store=store; self.progress=progress
         self.io=io; self.reader=reader; self.telemetry=telemetry; self.metrics=metrics
         self.scratch=scratch; self.selected=selected
+        self.inflight=set()
         self.queue=ThreadWorker(config.execution['s2_publish_queue_capacity'],
             config.execution['s2_publish_queue_bytes'],name='s2-publication',async_handler=True)
 
@@ -96,6 +100,7 @@ class ReferenceWorker:
                 self.store.reference_counts[base[:2]]=count
                 self.store.finish(base,'succeeded')
         await self.progress.call(acknowledge)
+        if final: self.inflight.discard(base)
         await self.telemetry.call(self.metrics.record,'commit',job=base,service='s2',seconds=time.monotonic()-started)
         directory=self.store.reference_cache_root(*base[:2])/fingerprint
         await self.telemetry.call(self.metrics.touch,directory/f'page-{offset:06d}.json',directory/f'page-{offset:06d}.complete.json')
@@ -103,6 +108,84 @@ class ReferenceWorker:
             await self.telemetry.call(self.metrics.record,'reference_snapshot',job=base,service='s2',references=count)
             await self.telemetry.call(self.metrics.touch,self.store.storage.result_dir(base))
             log(f'S2: {base[0]}v{base[1]} complete, {count} references')
+
+    def publish_batch_files(self,batch_id,local,entries,pass_number,fetched_at):
+        raw=local.read_bytes(); checksum=hashlib.sha256(raw).hexdigest()
+        batch_directory=self.store.root/'data'/'reference-batches'/f'pass-{pass_number}'
+        batch_directory.mkdir(parents=True,exist_ok=True)
+        batch_path=batch_directory/f'{batch_id}.json'; temporary=batch_path.with_suffix('.tmp')
+        with temporary.open('wb') as stream:
+            stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+        if digest(temporary)!=checksum: raise OSError('Batch response checksum mismatch')
+        temporary.replace(batch_path)
+        atomic_json(batch_path.with_suffix('.complete.json'),dict(
+            sha256=checksum,pass_number=pass_number,item_count=len(entries),fetched_at=fetched_at,
+            requested_identifiers=[entry['outcome']['requested_identifier'] for entry in entries]))
+        acknowledgements=[]
+        for index,entry in enumerate(entries):
+            key=entry['key']; outcome=entry['outcome']
+            if not outcome['complete']:
+                acknowledgements.append((key,None,outcome['error'])); continue
+            query,fingerprint=query_identity(key[0],key[1],self.config.network['s2_page_size'])
+            directory=self.store.reference_cache_root(*key[:2])/fingerprint
+            directory.mkdir(parents=True,exist_ok=True)
+            references=outcome['references']
+            atomic_json(directory/'normalized.json',dict(references=references,unresolved_count=0,
+                reference_count=outcome['reference_count'],fetched_at=fetched_at,
+                query_fingerprint=fingerprint,snapshot_id=uuid.uuid4().hex,
+                content_sha256=hashlib.sha256(json.dumps(references,sort_keys=True).encode()).hexdigest(),
+                batch_provenance={'batch_id':batch_id,'pass':pass_number,'index':index,
+                    'sha256':checksum,'returned_paper_id':outcome['returned_paper_id']},**query))
+            self.store.storage.commit(key,directory,include=['normalized.json'])
+            acknowledgements.append((key,len(references),''))
+        local.unlink()
+        return batch_path,acknowledgements
+
+    async def publish_batch(self,batch_id,local,entries,pass_number,fetched_at):
+        started=time.monotonic(); keys=[entry['key'] for entry in entries]
+        batch_path,acknowledgements=await self.io.call(
+            self.publish_batch_files,batch_id,local,entries,pass_number,fetched_at)
+        await self.progress.call(self.store.acknowledge_reference_batch,acknowledgements)
+        self.inflight.difference_update(keys)
+        await self.telemetry.call(self.metrics.record,'commit',job=keys[0],jobs=keys,
+                                  service='s2',seconds=time.monotonic()-started)
+        await self.telemetry.call(self.metrics.touch,batch_path,batch_path.with_suffix('.complete.json'))
+        complete_paths=[]
+        for key,count,_ in acknowledgements:
+            if count is None: continue
+            await self.telemetry.call(self.metrics.record,'reference_snapshot',job=key,service='s2',references=count)
+            complete_paths.append(self.store.storage.result_dir(key))
+        if complete_paths: await self.telemetry.call(self.metrics.touch,*complete_paths)
+        completed=sum(count is not None for _,count,_ in acknowledgements)
+        log(f'S2: batch pass {pass_number} published, {completed} complete, {len(keys)-completed} deferred')
+
+    async def fetch_batch(self,keys,scheduler):
+        identifiers=[query_identity(key[0],key[1],self.config.network['s2_page_size'])[0]['requested_identifier'] for key in keys]
+        result=await scheduler.request(keys,'s2','https://api.semanticscholar.org/graph/v1/paper/batch',
+            params={'fields':BATCH_FIELDS},method='POST',json_body={'ids':identifiers},
+            validate=lambda raw:(raw,parse_batch(raw,identifiers)))
+        if result is None:
+            rows=await self.progress.call(lambda:[dict(self.store.get(key)) for key in keys])
+            if 's2' in scheduler.stopped: return
+            errors={row['error'] for row in rows}
+            shrink=bool(errors) and all(error=='resource_limit' or error.startswith(('transport_','payload_')) for error in errors)
+            operation=self.store.reduce_reference_batch if shrink else self.store.advance_reference_pass
+            await self.progress.call(operation,keys,'batch_no_response')
+            return
+        raw,outcomes=result; size=len(raw); pass_number=(await self.progress.call(lambda:self.store.get(keys[0])['reference_pass']))
+        batch_id=uuid.uuid4().hex
+        local=self.scratch/f's2-batch-{batch_id}.json'
+        await self.reader.call(local.write_bytes,raw)
+        entries=[dict(key=key,outcome=outcome) for key,outcome in zip(keys,outcomes)]
+        self.inflight.update(keys)
+        try:
+            queued=time.monotonic()
+            await self.queue.submit(self.publish_batch,batch_id,local,entries,pass_number,utc_now(),weight=size)
+            await self.telemetry.call(self.metrics.record,'publication_queue_wait',job=keys[0],jobs=keys,
+                service='s2',seconds=time.monotonic()-queued,items=self.queue.used_items,bytes=self.queue.used_bytes)
+        except BaseException:
+            self.inflight.difference_update(keys)
+            raise
 
     async def fetch_snapshot(self,base,scheduler):
         paper,version=base[:2]
@@ -162,6 +245,39 @@ class ReferenceWorker:
             peak_items=self.queue.peak_items,peak_bytes=self.queue.peak_bytes)
 
     async def fetch_loop(self,scheduler,discovery_done):
+        if not self.config.network['s2_batch_size']:
+            return await self.fetch_loop_individual(scheduler,discovery_done)
+        announced=False
+        while 's2' not in scheduler.stopped:
+            rows=await self.progress.call(lambda:[(k,dict(r)) for k,r in self.store.rows.items()
+                if k[0] in self.selected and k[1]>0 and k[2:] == ('references',0)
+                and r['status'] in ('pending','running')])
+            if not rows:
+                if self.queue.used_items: await asyncio.sleep(.01); continue
+                if discovery_done.is_set():
+                    if not announced: log('S2: no eligible version jobs; discovery must enumerate versions first')
+                    break
+                await asyncio.sleep(.1); continue
+            announced=True
+            current_pass=min(row['reference_pass'] for _,row in rows)
+            if current_pass>1 and not discovery_done.is_set():
+                await asyncio.sleep(.1); continue
+            available=[(key,row) for key,row in rows if row['reference_pass']==current_pass and key not in self.inflight]
+            if not available:
+                await asyncio.sleep(.01); continue
+            if current_pass>=5:
+                key=available[0][0]; self.inflight.add(key)
+                await self.fetch_snapshot(key,scheduler)
+                status=await self.progress.call(lambda:self.store.get(key)['status'])
+                if status!='running': self.inflight.discard(key)
+                continue
+            cap=min(row['batch_cap'] for _,row in available)
+            attempts=min(row['attempts'] for _,row in available if row['batch_cap']==cap)
+            keys=[key for key,row in available if row['batch_cap']==cap and row['attempts']==attempts]
+            keys=sorted(keys)[:min(cap,self.config.network['s2_batch_size'])]
+            await self.fetch_batch(keys,scheduler)
+
+    async def fetch_loop_individual(self,scheduler,discovery_done):
         visited=set()
         while 's2' not in scheduler.stopped:
             keys=await self.progress.call(lambda:sorted(k for k,r in self.store.rows.items()

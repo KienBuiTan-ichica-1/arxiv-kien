@@ -2,9 +2,11 @@
 
 ## Phạm vi
 
-Crawler gửi `GET /graph/v1/paper/{identifier}/references`, trong đó identifier là
-`URL:https://arxiv.org/abs/<ID>v<N>` được URL-encode. Không thêm bước POST batch
-resolve paperId, không fallback sang ID gốc nếu URL version trả 404.
+Crawler gửi `POST /graph/v1/paper/batch` với tối đa 100 identifier
+`URL:https://arxiv.org/abs/<ID>v<N>`. Bốn lượt batch chỉ nhận một version khi
+`len(references) == referenceCount`; mục thiếu chuyển sang lượt sau. Lượt 5 gửi
+`GET /graph/v1/paper/{identifier}/references` có pagination cho từng version.
+Không fallback sang ID gốc nếu URL version không phân giải được.
 [Schema API chính thức](https://api.semanticscholar.org/graph/v1/swagger.json)
 có định danh URL với ví dụ arXiv v1; page size tối đa 1000, mặc định crawler 100.
 
@@ -24,11 +26,12 @@ arXiv scheduler chung: discovery / metadata / source
   → progress writer: ghi journal, trả acknowledgement
   → request arXiv kế tiếp
 
-S2 scheduler riêng: URL vN / pagination / retry
-  → staging page trên scratch
+S2 scheduler riêng: URL vN / batch / pagination / retry
+  → validate response; batch đủ count mới được publish
+  → staging response trên scratch
   → queue publish có giới hạn số mục và bytes
-  → publisher S2: I/O trong thread riêng, lưu page cache lên Drive
-  → progress writer: ghi hoàn tất page; trang cuối publish snapshot rồi ghi hoàn tất version
+  → publisher S2: lưu raw batch một lần và snapshot từng version lên Drive
+  → progress writer: ack succeeded hoặc chuyển job thiếu sang pass kế tiếp
 
 Cả hai scheduler → progress writer → ghi attempt bền vững → mới gửi HTTP
 ```
@@ -51,16 +54,17 @@ Trong `config/crawler.yaml`, nhóm `execution`:
 | Biến | Mặc định | Phạm vi |
 |---|---:|---|
 | `progress_queue_capacity` | 100 | Cả thao tác progress đang xử lý và đang chờ |
-| `s2_publish_queue_capacity` | 8 | Page đang publish và đang chờ acknowledgement |
+| `s2_publish_queue_capacity` | 8 | Batch/page đang publish và đang chờ acknowledgement |
 | `s2_publish_queue_bytes` | 33554432 | Tổng raw bytes đã nhận vào queue, kể cả mục đang xử lý |
-| `s2_response_max_bytes` | 8388608 | Raw JSON decoded của một response; quá giới hạn → failed/resource_limit |
+| `s2_response_max_bytes` | 12582912 | Raw JSON decoded của một response; lớn hơn giới hạn API 10 MB và vẫn dưới queue budget |
 | `s2_snapshot_max_bytes` | 67108864 | Tổng raw page bytes của một version |
 
 Ngoài queue có thể tồn tại **một response** đang tải hoặc đang chờ admission.
 Giới hạn này đo payload, không phải tổng RSS: Python objects, parsed JSON,
 HTTP buffers và lúc lắp ráp snapshot vẫn cần RAM bổ sung. Queue giữ đường dẫn
-file scratch cùng thông tin truy vấn, không giữ toàn bộ response của nhiều trang.
-Một version quá giới hạn thành failed; không chờ vô hạn cho một mục quá lớn.
+file scratch cùng thông tin truy vấn, không giữ toàn bộ response của nhiều batch/page.
+Batch quá giới hạn đi qua retry rồi giảm cap; pagination pass 5 vẫn áp giới hạn
+theo response/snapshot và không chờ vô hạn cho một mục quá lớn.
 Queue đầy thì fetcher chờ; không bỏ dữ liệu hay tạo vô hạn thread.
 
 Scratch mặc định có thể ở Drive; bật cell SSD trong notebook để staging thực sự
@@ -86,7 +90,15 @@ runtime/data/<paper>/
     source/
     reference-staging/<fingerprint>/   # page cache bền vững
     references/                        # raw pages, normalized, complete, verification
+
+runtime/data/reference-batches/pass-N/ # raw batch response + receipt checksum
 ```
+
+Base reference job lưu `reference_pass` và `batch_cap` trong jobs.csv/journal.
+Pass hiện tại là pass nhỏ nhất còn pending/running, nên resume giữa lượt tiếp tục
+đúng lượt; nếu ngắt ngay ranh giới thì lần sau tự suy ra lượt kế tiếp. Pass 1–4
+đều bắt đầu cap 100. Transport/payload không có response dùng được retry ba lần
+rồi giảm `100→75→50→25`; response 200 thiếu count chuyển pass nhưng không giảm cap.
 
 `status_counts()['references']` đếm **version snapshots**, không đếm page/ref.
 `legacy_references` giữ thống kê v0 khi có jobs version mới. Trước lần chạy nâng

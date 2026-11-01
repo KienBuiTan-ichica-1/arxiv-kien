@@ -5,7 +5,7 @@ from crawler.pipeline import run_pipeline
 
 def test_broadcast(tmp_path,monkeypatch):
     monkeypatch.chdir(tmp_path)
-    c=CrawlerConfig(); c.execution['allow_anonymous_s2']=True; c.range['end_id']=2523
+    c=CrawlerConfig(); c.execution['allow_anonymous_s2']=True; c.range['end_id']=2523; c.network['s2_batch_size']=0
     seen=[]
     def handler(request):
         seen.append(request.url.host)
@@ -18,7 +18,7 @@ def test_reference_page_resume(tmp_path,monkeypatch):
     import json
     from crawler.progress import ProgressStore
     monkeypatch.chdir(tmp_path)
-    c=CrawlerConfig(); c.execution['allow_anonymous_s2']=True; c.range['end_id']=2523
+    c=CrawlerConfig(); c.execution['allow_anonymous_s2']=True; c.range['end_id']=2523; c.network['s2_batch_size']=0
     store=ProgressStore('runtime'); store.initialize(['2504.02523'])
     store.add(('2504.02523',1,'references',0)); store.save()
     calls=[]

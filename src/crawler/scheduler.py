@@ -58,9 +58,11 @@ class Scheduler:
             before=time.monotonic()
             await self.sleep(duration)
             await self.event_async('wait_end',job=job,jobs=jobs,reason=reason,seconds=time.monotonic()-before)
-    async def request(self, key, service, url, params=None, target=None, validate=None):
+    async def request(self, key, service, url, params=None, target=None, validate=None,method='GET',json_body=None):
         if service in self.stopped:
             return None
+        if method not in ('GET','POST') or (json_body is not None and method!='POST'):
+            raise ValueError('Invalid request method/body')
         expected_host = 'export.arxiv.org' if service=='arxiv' else 'api.semanticscholar.org'
         if urlsplit(url).hostname != expected_host or urlsplit(url).scheme!='https': raise ValueError('Disallowed service URL')
         net=self.config.network; state=self.state[service]
@@ -71,8 +73,10 @@ class Scheduler:
         if not batch_keys or len(set(batch_keys))!=len(batch_keys): raise ValueError('Expected distinct job keys')
         attempts={(await self.store_call('get',k))['attempts'] for k in batch_keys}
         if len(attempts)!=1: raise ValueError('Batch members must have the same attempt count')
-        if len(batch_keys)>1 and (service!='arxiv' or len({k[2] for k in batch_keys})!=1 or any(k[2] not in ('discovery','metadata') for k in batch_keys)):
-            raise ValueError('Batch requests support homogeneous arXiv metadata stages only')
+        valid_arxiv_batch=service=='arxiv' and len({k[2] for k in batch_keys})==1 and all(k[2] in ('discovery','metadata') for k in batch_keys)
+        valid_s2_batch=service=='s2' and all(k[2:] == ('references',0) for k in batch_keys)
+        if len(batch_keys)>1 and not (valid_arxiv_batch or valid_s2_batch):
+            raise ValueError('Invalid batch request jobs')
         primary_key = batch_keys[0]
         async def emit(name,**fields):
             fields.pop('job',None)
@@ -108,7 +112,7 @@ class Scheduler:
                             await self.wait(self.now()+remaining,primary_key,reason='dispatch_pacing',jobs=batch_keys)
                         sent_at=self.now()
                         state['recent'][-1]=sent_at
-                    async with self.client.stream('GET',url,params=params,headers=headers,follow_redirects=False) as response:
+                    async with self.client.stream(method,url,params=params,json=json_body,headers=headers,follow_redirects=False) as response:
                         code=response.status_code
                         retry_after=parse_retry_after(response.headers.get('Retry-After'),datetime.fromtimestamp(self.now(),timezone.utc))
                         if code==429:

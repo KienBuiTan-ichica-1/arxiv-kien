@@ -12,6 +12,7 @@ paths:
 network:
   discovery_batch_size: 50
   metadata_batch_size: 50
+  s2_batch_size: 100
 execution:
   allow_anonymous_s2: false
   progress_queue_capacity: 100

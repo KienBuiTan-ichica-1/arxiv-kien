@@ -17,7 +17,7 @@ from crawler.storage import atomic_json, digest
 @pytest.mark.parametrize('damage', ['missing', 'checksum', 'invalid_json', 'invalid_page', 'invalid_marker'])
 def test_resume_repairs_completed_page_without_resetting_budget(tmp_path, monkeypatch, damage):
     monkeypatch.chdir(tmp_path)
-    config=CrawlerConfig(); config.range['end_id']=2523
+    config=CrawlerConfig(); config.range['end_id']=2523; config.network['s2_batch_size']=0
     config.execution['allow_anonymous_s2']=True
     store=ProgressStore('runtime'); paper='2504.02523'
     store.initialize([paper]); base=(paper,1,'references',0); page=(paper,1,'references',100); store.add(base)
@@ -53,7 +53,7 @@ def test_resume_repairs_completed_page_without_resetting_budget(tmp_path, monkey
 
 def test_exhausted_missing_page_does_not_stop_other_papers(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    config=CrawlerConfig(); config.range['end_id']=2524; config.execution['allow_anonymous_s2']=True
+    config=CrawlerConfig(); config.range['end_id']=2524; config.execution['allow_anonymous_s2']=True; config.network['s2_batch_size']=0
     store=ProgressStore('runtime'); ids=['2504.02523','2504.02524']; store.initialize(ids)
     base=(ids[0],1,'references',0); page=(ids[0],1,'references',100)
     for paper in ids: store.add((paper,1,'references',0))

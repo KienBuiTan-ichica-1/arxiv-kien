@@ -44,7 +44,7 @@ def test_slow_arxiv_publish_does_not_block_s2(tmp_path,monkeypatch):
     from crawler.pipeline import run_pipeline
     from crawler.storage import Storage
     monkeypatch.chdir(tmp_path)
-    c=CrawlerConfig(); c.range['end_id']=2523; c.execution['allow_anonymous_s2']=True
+    c=CrawlerConfig(); c.range['end_id']=2523; c.execution['allow_anonymous_s2']=True; c.network['s2_batch_size']=0
     store=ProgressStore('runtime'); store.initialize(['2504.02523']); store.add(('2504.02523',1,'references',0)); store.save()
     entered=threading.Event(); s2_seen=threading.Event(); observed=[]
     original=Storage.commit
@@ -64,11 +64,13 @@ def test_slow_arxiv_publish_does_not_block_s2(tmp_path,monkeypatch):
 
 def test_refresh_references_preserves_attempt_history(tmp_path):
     store=ProgressStore(tmp_path); store.initialize(['2504.02523'])
-    key=('2504.02523',0,'references',0)
+    key=('2504.02523',1,'references',0); store.add(key)
+    store.get(key).update(reference_pass=5,batch_cap=25); store.save()
     store.start_attempt(key); store.finish(key,'failed')
     store.refresh('references',{'2504.02523'})
     row=ProgressStore(tmp_path).get(key)
     assert (row['status'],row['attempts'],row['total'],row['cycle'])==('pending',0,1,2)
+    assert (row['reference_pass'],row['batch_cap'])==(1,100)
 
 
 def test_diagnostics_reads_old_logs_and_torn_tail(tmp_path):
