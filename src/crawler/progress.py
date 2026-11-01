@@ -176,6 +176,25 @@ class ProgressStore:
                            cycle=row['cycle']+1,error=error)
             self.save()
 
+    def acknowledge_reference_batch(self,results):
+        """Atomically publish complete counts and defer incomplete jobs one pass."""
+        with self.lock:
+            for key,count,error in results:
+                row=self.rows[key]
+                if key[2:]!=('references',0) or row['reference_pass'] not in range(1,5):
+                    raise ValueError('Invalid batch acknowledgement')
+                if count is not None and (type(count) is not int or count<0):
+                    raise ValueError('Invalid reference count')
+            for key,count,error in results:
+                row=self.rows[key]
+                if count is not None:
+                    row.update(status='succeeded',error='')
+                    self.reference_counts[key[:2]]=count
+                else:
+                    row.update(reference_pass=row['reference_pass']+1,batch_cap=100,
+                               status='pending',attempts=0,cycle=row['cycle']+1,error=error)
+            self.save()
+
     def reconcile(self,recover_running=True,*,ids=None,stages=None,recovery_only=False,skip_legacy_references=False):
         with self.lock:
             for key,row in list(self.rows.items()):
