@@ -1,4 +1,5 @@
 import asyncio
+import json
 import httpx
 from crawler.scheduler import Scheduler
 from crawler.config import CrawlerConfig
@@ -64,4 +65,24 @@ def test_auth_stops_service_and_anonymous_window(tmp_path):
             for paper in ('2504.02523','2504.02524'):
                 await scheduler.request((paper,0,'references',0),'s2','https://api.semanticscholar.org/graph/v1/paper/test/references')
             assert len(calls)==1 and 's2' in scheduler.stopped
+    asyncio.run(check())
+
+def test_s2_batch_post_retries_transport_failure_with_same_body(tmp_path):
+    async def check():
+        store=ProgressStore(tmp_path); store.initialize(['2504.02523','2504.02524'])
+        keys=[]
+        for paper in ('2504.02523','2504.02524'):
+            key=(paper,1,'references',0); store.add(key); keys.append(key)
+        store.save(); calls=[]; clock=[1000.]
+        async def sleep(seconds): clock[0]+=seconds
+        def handler(request):
+            calls.append((request.method,json.loads(request.content)))
+            if len(calls)==1: raise httpx.ReadError('temporary',request=request)
+            return httpx.Response(200,content=b'[]')
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            scheduler=Scheduler(CrawlerConfig(),store,client,api_key='key',now=lambda:clock[0],sleep=sleep)
+            result=await scheduler.request(keys,'s2','https://api.semanticscholar.org/graph/v1/paper/batch',
+                method='POST',json_body={'ids':['URL:v1','URL:v2']})
+        assert result==b'[]'
+        assert calls==[('POST',{'ids':['URL:v1','URL:v2']})]*2
     asyncio.run(check())
