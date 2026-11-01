@@ -10,6 +10,11 @@ Cooldown và attempts được lưu trước khi tiếp tục. Không tự retry
 Xem [luồng worker, giới hạn queue, chuyển dữ liệu cũ và cách smoke](docs/versioned-reference-workers.md).
 References mới truy vấn URL arXiv vN, lưu riêng từng version; snapshot v0 giữ nguyên.
 Chưa kiểm chứng rằng S2 trả bibliography lịch sử tương ứng từng version.
+S2 chạy bốn lượt `POST /paper/batch`, tối đa 100 version mỗi request. Chỉ
+snapshot có `len(references) == referenceCount` mới hoàn tất; mục thiếu chuyển
+sang lượt kế tiếp. Sau lượt 4, crawler dùng endpoint references có pagination
+riêng cho từng version. Lỗi toàn batch giảm cap `100→75→50→25`; 429 vẫn theo
+`Retry-After` và không làm giảm cap.
 
 ## Kết quả smoke do người dùng cung cấp (bản paper-level cũ)
 
@@ -50,6 +55,8 @@ Giải thích chi tiết từng file: [docs/runtime-files.md](docs/runtime-files
 - Kết quả chỉ hợp lệ khi marker/checksum khớp. Legacy marker vẫn được đọc;
   marker mới thêm UTC captured_at, run_id và số byte.
 - `reference-staging/`: raw pages có checksum/fingerprint để resume giữa trang.
+- `data/reference-batches/pass-N/`: raw batch response S2 và receipt checksum;
+  snapshot version lưu provenance trỏ về batch/index tương ứng.
 - `history/`: kết quả cũ được giữ khi chủ động refresh.
 - `metrics/<run_id>/`: environment, samples RAM/disk, paper elapsed và summary.
 - `logs/<run_id>/events.jsonl`: request, retry, wait heartbeat, commit, recovery.
