@@ -52,7 +52,7 @@ class Scheduler:
         if self.io_worker: return await self.io_worker.call(function,*args,**kwargs)
         return function(*args,**kwargs)
     async def wait(self,deadline,job=None,reason='service_cooldown',jobs=None):
-        while self.now()<deadline:
+        while self.now()+1e-9<deadline:
             duration=min(30,deadline-self.now())
             await self.event_async('waiting',job=job,jobs=jobs,reason=reason,remaining_seconds=deadline-self.now())
             before=time.monotonic()
@@ -103,12 +103,10 @@ class Scheduler:
                 try:
                     if service=='s2':
                         # Check again AFTER durable writes/logging; their latency can vary.
-                        while self.monotonic()<self.s2_next_send or self.now()<deadline:
+                        while self.monotonic()+1e-9<self.s2_next_send or self.now()+1e-9<deadline:
                             remaining=max(self.s2_next_send-self.monotonic(),deadline-self.now(),0)
                             await self.wait(self.now()+remaining,primary_key,reason='dispatch_pacing',jobs=batch_keys)
                         sent_at=self.now()
-                        self.s2_next_send=self.monotonic()+gap
-                        state['deadline']=max(state['deadline'],sent_at+gap)
                         state['recent'][-1]=sent_at
                     async with self.client.stream('GET',url,params=params,headers=headers,follow_redirects=False) as response:
                         code=response.status_code
@@ -191,6 +189,9 @@ class Scheduler:
                                     'validation_end', job = key,
                                     seconds = time.monotonic() - extract_started
                                 )
+                            if service=='s2':
+                                self.s2_next_send=self.monotonic()+gap
+                                state['deadline']=max(state['deadline'],self.now()+gap)
                             return result
                         elif code not in (408,429) and code<500:
                             if code in (401,403):

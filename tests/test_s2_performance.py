@@ -25,17 +25,18 @@ def test_repeated_429_backoff_bounded_but_retry_after_preserved(tmp_path):
     asyncio.run(run())
 
 
-def test_s2_latency_counts_towards_gap(tmp_path):
+def test_s2_gap_starts_after_valid_response(tmp_path):
     async def run():
         ids=['2504.00001','2504.00002']; store=ProgressStore(tmp_path); store.initialize(ids)
         clock=[1000.]; starts=[]
         async def sleep(n): clock[0]+=n
         def handler(r): starts.append(clock[0]); clock[0]+=2; return httpx.Response(200,json={'data':[]})
+        def validate(raw): clock[0]+=3; return raw
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             scheduler=Scheduler(CrawlerConfig(),store,client,api_key='test',now=lambda:clock[0],sleep=sleep)
             for paper in ids:
-                await scheduler.request((paper,0,'references',0),'s2','https://api.semanticscholar.org/graph/v1/paper/test/references')
-        assert starts==[1000.,1002.]
+                await scheduler.request((paper,0,'references',0),'s2','https://api.semanticscholar.org/graph/v1/paper/test/references',validate=validate)
+        assert starts==[1000.,1006.1]
     asyncio.run(run())
 
 
